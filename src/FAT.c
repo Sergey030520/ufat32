@@ -1,0 +1,3506 @@
+#include "FAT.h"
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
+#include <ctype.h>
+#include "DateTime.h"
+#include "pool_memory.h"
+#include "file_utils.h"
+
+FatLayoutInfo *fat_info = NULL;
+
+void *stm_memcpy(void *dest, const void *src, uint32_t size);
+int path_depth(char *path);
+int parse_path(char *path, char (*name_files)[MAX_NAME_SIZE]);
+void format_fat_sfn(const char *input, uint16_t length, char output[11]);
+int create_dir_fat32(char *name, uint32_t name_length, uint32_t parent_cluster);
+int is_special_dir(char dir_name[11]);
+int find_entry_cluster_fat32(char *name, uint32_t length, uint32_t parent_cluster, uint32_t *out_cluster);
+int get_attr_entry_fat32(uint32_t cluster_parent, uint32_t child_cluster, uint8_t *attr);
+
+void generate_sfn_from_lfn(char *name, uint32_t length, uint8_t buffer[11]);
+int find_free_dir_entries(uint32_t parent_cluster, const uint16_t entry_count, DirEntryPosition *position);
+int make_lfn_entries(const char *name, uint32_t length, uint8_t chkSum, LDIR_Type *entries, uint16_t numb_entries);
+FAT32_File *init_file_handle(const char *file_name, uint32_t parent_cluster, uint8_t mode);
+int read_directory_entry_fat32(DirEntryPosition *position, FatDir_Type *entry);
+int write_dir_entries_at(const DirEntryPosition *position, const void *entries, uint16_t entry_count);
+int is_free_entry_fat32(FatDir_Type *entry);
+int extend_cluster_chain_if_needed(uint32_t *last_cluster);
+int allocate_cluster_fat32(uint32_t *new_cluster);
+int get_next_cluster_fat32(uint32_t *prev_cluster);
+int is_dir_empty_fat32(uint32_t cluster);
+int update_fat32(uint32_t cluster, uint32_t value);
+int find_free_cluster(uint32_t *free_cluster);
+void join_cluster_number(uint32_t *cluster, uint16_t high, uint16_t low);
+void split_cluster_number(uint32_t cluster, uint16_t *high, uint16_t *low);
+uint8_t ChkSum(uint8_t *pFcbName);
+
+void ascii_to_utf16le(const char *ascii_str, uint8_t *utf16le_buf);
+void utf16le_to_ascii(const uint16_t *utf16le_buf, char *ascii_str);
+
+/**
+ * Вычисляет глубину указанного пути.
+ *
+ * Например:
+ *   "/"                      - 0
+ *   "/folder"               - 1
+ *   "/folder/sub"           - 2
+ *
+ * @param path  Строка пути.
+ * @return Количество уровней  или FAT_ERR_INVALID_ARGUMENT при недопустимом аргументе.
+ */
+int path_depth(char *path)
+{
+    if (path == NULL)
+        return FAT_ERR_INVALID_ARGUMENT;
+    uint32_t len = strlen(path);
+    char *buff = pool_alloc(len + 1);
+    if (buff == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+    memcpy(buff, path, len + 1);
+    char *token = strtok(buff, "/");
+    int depth = 0;
+    while (token != NULL)
+    {
+        ++depth;
+        token = strtok(NULL, "/");
+    }
+    if (pool_free_region(buff, len + 1) != 0)
+    {
+        // Вывод в лог
+    }
+    return depth;
+}
+
+/**
+ * Разбирает путь и сохраняет имена всех компонентов (каталогов и/или файла) в массив.
+ *
+ * Например, для пути "/dir1/dir2/file.txt" в name_files будут:
+ *   name_files[0] = "dir1"
+ *   name_files[1] = "dir2"
+ *   name_files[2] = "file.txt"
+ *
+ * @param path        Строка пути (например: "/folder/file").
+ * @param name_files  Двумерный массив, куда будут сохранены имена компонентов пути.
+ *                    Каждый элемент должен быть размером не менее MAX_NAME_SIZE.
+ *
+ * @return Количество извлечённых компонентов пути, или -1 при ошибке (например, если path == NULL).
+ */
+int parse_path(char *path, char (*name_files)[MAX_NAME_SIZE])
+{
+    if (path == NULL || name_files == NULL)
+        return FAT_ERR_INVALID_ARGUMENT;
+
+    int status = 0;
+    const size_t path_len = strlen(path);
+    char *buff = pool_alloc(path_len + 1);
+
+    if (buff == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+
+    stm_memcpy(buff, path, path_len);
+    buff[path_len] = '\0';
+
+    char *token = strtok(buff, "/");
+    int idxWord = 0;
+    size_t token_len = 0;
+
+    while (token != NULL)
+    {
+        token_len = strlen(token);
+        if (token_len >= MAX_NAME_SIZE)
+        {
+            status = pool_free_region(buff, path_len + 1);
+            if (status != 0)
+            {
+                // Логирование вставить
+            }
+            return FAT_ERR_NAME_TOO_LONG;
+        }
+        stm_memcpy(name_files[idxWord++], token, token_len + 1);
+        token = strtok(NULL, "/");
+    }
+    status = pool_free_region(buff, path_len + 1);
+    if (status != 0)
+    {
+        // Логирование вставить
+    }
+    return idxWord;
+}
+
+/**
+ * Ищет последнее вхождение заданного символа в строке.
+ *
+ * @param text    Указатель на строку.
+ * @param symbol  Символ, который необходимо найти.
+ *
+ * @return Указатель на последнее вхождение символа в строке,
+ *         или NULL, если символ не найден или входной указатель NULL.
+ */
+char *find_last_char(char *text, char symbol)
+{
+    if (text == NULL)
+        return NULL;
+    int idx = strlen(text) - 1;
+    for (int idx = strlen(text) - 1; idx >= 0; --idx)
+    {
+        if (*(text + idx) == symbol)
+            return text + idx;
+    }
+    return NULL;
+}
+
+/**
+ * Извлекает путь к директории из полного пути к файлу/каталогу.
+ *
+ * Например, из "/folder1/folder2/file.txt" вернёт "/folder1/folder2/".
+ *
+ * @param path      Полный путь к файлу.
+ * @param dir_path  Буфер, куда будет записан путь к директории.
+ * @param size      Размер буфера dir_path.
+ * @return 0 при успехе,
+ *          FAT_ERR_INVALID_ARGUMENT если аргументы некорректны,
+ *         FAT_ERR_INVALID_PATH если не найден символ '/',
+ *         POOL_ERR_ALLOCATION_FAILED при ошибке выделения памяти.
+ */
+int get_dir_path(char *path, char *dir_path, int size)
+{
+    if (path == NULL || dir_path == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+
+    int length = strlen(path);
+    int status = 0;
+
+    char *pathToFile = pool_alloc(length);
+    if (pathToFile == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+
+    // Если в конце пути указан / заменяем на конец строки
+    strcpy(pathToFile, path);
+    if (length > 0 && pathToFile[length - 1] == '/')
+        *(pathToFile + (length - 1)) = '\0';
+
+    // Ищем последний символ '/'
+    char *last_slash = find_last_char(pathToFile, '/');
+    if (last_slash == NULL)
+    {
+        status = pool_free_region(pathToFile, length);
+        if (status != 0)
+        {
+            // вывести в лог
+        };
+        return FAT_ERR_INVALID_PATH;
+    }
+
+    // Извлекаем путь до директории
+    size_t path_len = last_slash - pathToFile + 1;
+    strncpy(dir_path, pathToFile, path_len);
+    dir_path[path_len] = '\0';
+    status = pool_free_region(pathToFile, length);
+    if (status != 0)
+    {
+        // вывести в лог
+    };
+    return 0;
+}
+
+/**
+ * Извлекает последнюю компоненту (имя файла или папки) из указанного пути.
+ *
+ * Например, из "/folder1/folder2/file.txt" вернёт "file.txt".
+ *
+ * @param path           Полный путь.
+ * @param name_component Буфер для записи последней компоненты пути.
+ * @return 0 при успехе,
+ *         FAT_ERR_INVALID_ARGUMENT если path или name_component равны NULL,
+ *         FAT_ERR_INVALID_PATH если в пути не найдено ни одного '/',
+ *         POOL_ERR_ALLOCATION_FAILED при ошибке выделения памяти.
+ */
+int get_last_path_component(char *path, char *name_component)
+{
+    if (path == NULL || name_component == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+
+    int length = strlen(path);
+    int status = 0;
+    char *pathToFile = pool_alloc(length);
+    if (pathToFile == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+
+    strcpy(pathToFile, path);
+    if (length > 0 && pathToFile[length - 1] == '/')
+    {
+        pathToFile[length - 1] = '\0';
+    }
+
+    // Ищем последнее вхождение символа '/'
+    char *last_slash = find_last_char(pathToFile, '/');
+    if (last_slash == NULL)
+    {
+        status = pool_free_region(pathToFile, length);
+        if (status != 0)
+        {
+            // вывести в лог
+        }
+        return FAT_ERR_INVALID_PATH;
+    }
+    // Копируем имя файла/директории в name_component
+    strcpy(name_component, last_slash + 1);
+
+    status = pool_free_region(pathToFile, length);
+    if (status != 0)
+    {
+        // вывести в лог
+    }
+
+    return 0;
+}
+
+/**
+ * Копирует заданное количество байт из источника в назначение.
+ *
+ * Не зависит от стандартной библиотеки C.
+ *
+ * @param dest  Указатель на буфер назначения.
+ * @param src   Указатель на источник данных.
+ * @param size  Количество байт для копирования.
+ * @return Указатель на буфер назначения, или NULL, если dest и src равны NULL.
+ */
+void *stm_memcpy(void *dest, const void *src, uint32_t size)
+{
+    if ((dest == 0) && (src == 0))
+    {
+        return 0;
+    }
+    uint8_t *dest_local = dest;
+    uint8_t *src_local = src;
+    while (size-- > 0)
+    {
+        *dest_local = *src_local;
+        ++dest_local;
+        ++src_local;
+    }
+    return dest;
+}
+
+/**
+ * Вычисляет размер таблицы FAT32 в секторах.
+ *
+ * Размер рассчитывается на основе общего объёма и структуры MBR (Main Boot Record),
+ * включая количество кластеров и размер одного кластера.
+ *
+ * @param capacity   Общий объём накопителя в байтах.
+ * @param mbr_data   Указатель на структуру MBR_Type с параметрами разметки.
+ *
+ * @return Размер FAT-таблицы в секторах.
+ *         0 — в случае некорректных входных данных (например, ёмкость меньше зарезервированных секторов).
+ */
+uint32_t calculate_size_table_fat32(uint64_t capacity, MBR_Type *mbr_data)
+{
+    uint32_t total_sectors = (uint32_t)(capacity / mbr_data->BPB_BytsPerSec);
+
+    if (total_sectors <= mbr_data->BPB_RsvdSecCnt)
+        return 0;
+
+    total_sectors -= mbr_data->BPB_RsvdSecCnt;
+
+    uint32_t fat_size = 0;
+    uint32_t data_sectors;
+    uint32_t clusters;
+
+    fat_size = (uint32_t)((((total_sectors * 4ULL) / mbr_data->BPB_SecPerClus) + (mbr_data->BPB_BytsPerSec - 1)) / mbr_data->BPB_BytsPerSec);
+
+    data_sectors = total_sectors - (mbr_data->BPB_NumFATs * fat_size);
+    clusters = data_sectors / mbr_data->BPB_SecPerClus;
+
+    fat_size = (uint32_t)(((clusters * 4ULL) + (mbr_data->BPB_BytsPerSec - 1)) / mbr_data->BPB_BytsPerSec);
+
+    return fat_size;
+}
+
+int seek_file_fat32(FAT32_File *file, int32_t offset, SEEK_Mode mode)
+{
+    if (fat_info == NULL || file == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+    int32_t position = 0;
+    uint32_t bytes_per_cluster = fat_info->bytesPerSec * fat_info->secPerClus;
+    uint32_t count_cluster = offset / bytes_per_cluster;
+    int status = 0;
+
+    if (mode == F_SEEK_SET)
+    {
+        position = offset;
+    }
+    else if (mode == F_SEEK_CUR)
+    {
+        position = file->position.cluster_idx * fat_info->bytesPerSec * fat_info->secPerClus + file->position.sector_idx * fat_info->bytesPerSec + file->position.byte_offset + offset;
+    }
+    else if (mode == F_SEEK_END)
+    {
+        position = file->size_bytes + offset;
+    }
+    else
+    {
+        return FAT_ERR_INVALID_SEEK_MODE;
+    }
+
+    if (position > file->size_bytes || position < 0)
+    {
+        return FAT_ERR_INVALID_POSITION;
+    }
+
+    if (mode == F_SEEK_SET || mode == F_SEEK_END)
+    {
+        file->position.cluster_number = file->first_cluster;
+        file->position.cluster_idx = 0;
+        file->position.sector_idx = 0;
+        file->position.byte_offset = 0;
+    }
+
+    uint32_t clusters_to_move = position / bytes_per_cluster;
+    uint32_t next_cluster = file->position.cluster_number;
+    uint32_t offset_in_cluster = position % bytes_per_cluster;
+
+    while (file->position.cluster_idx != count_cluster)
+    {
+        status = get_next_cluster_fat32(&next_cluster);
+        if (status == -1 || next_cluster == FILE_END_TABLE_FAT32)
+        {
+            return FAT_ERR_CLUSTER_CHAIN_BROKEN;
+        }
+        file->position.cluster_idx++;
+    }
+
+    file->position.cluster_number = next_cluster;
+    file->position.sector_idx = offset_in_cluster / fat_info->bytesPerSec;
+    file->position.byte_offset = offset_in_cluster % fat_info->bytesPerSec;
+    return 0;
+}
+
+/**
+ * Освобождает цепочку кластеров в FAT32, начиная с указанного кластера.
+ *
+ * Функция проходит по цепочке кластеров, начиная с `cluster`, и помечает каждый кластер как свободный.
+ *
+ * @param cluster Начальный кластер для освобождения.
+ * @return 0 при успешном освобождении,
+ *         FAT_ERR_FS_NOT_LOADED если файловая система не инициализирована,
+ *         код ошибки из get_next_cluster_fat32 при ошибке чтения,
+ *         FAT_ERR_UPDATE_FAILED при ошибке обновления таблицы FAT.
+ */
+int free_cluster_fat32(uint32_t cluster)
+{
+    if (fat_info == NULL)
+        return FAT_ERR_FS_NOT_LOADED;
+
+    uint32_t next_cluster = 0;
+    int status = 0;
+    while (1)
+    {
+        next_cluster = cluster;
+        status = get_next_cluster_fat32(&next_cluster);
+        if (status != 0)
+        {
+            return status;
+        }
+        if (next_cluster == FILE_END_TABLE_FAT32)
+        {
+            break;
+        }
+        status = update_fat32(cluster, NOT_USED_CLUSTER_FAT32);
+        if (status != 0)
+        {
+            return FAT_ERR_UPDATE_FAILED;
+        }
+        cluster = next_cluster;
+    }
+
+    // Освободить последний кластер
+    status = update_fat32(cluster, NOT_USED_CLUSTER_FAT32);
+    if (status != 0)
+    {
+        return FAT_ERR_UPDATE_FAILED;
+    }
+    return 0;
+}
+
+/**
+ * Ищет запись файла или папки по имени в указанном родительском кластере.
+ *
+ * Функция перебирает все сектора в кластере и его цепочке, обрабатывая как обычные имена (8.3),
+ * так и длинные имена (LFN). Если запись найдена, позиция сохраняется в структуре entry_pos.
+ *
+ * @param name           Имя файла или папки, которое необходимо найти (длинное имя поддерживается).
+ * @param parent_cluster Кластер каталога, в котором производится поиск.
+ * @param entry_pos      Указатель на структуру DirEntryPosition, в которую будет записано положение найденной записи.
+ *
+ * @return 0 — если запись найдена,
+ *         FAT_ERR_INVALID_ARGUMENT — если указаны некорректные параметры (например, name == NULL),
+ *         FAT_ERR_ENTRY_NOT_FOUND — если запись с заданным именем не найдена,
+ *         FAT_ERR_ENTRY_CORRUPTED — если структура LFN повреждена или нарушена,
+ *         FAT_ERR_READ_FAIL — если произошла ошибка чтения с SD-карты,
+ *         POOL_ERR_ALLOCATION_FAILED — если не удалось выделить буфер из пула памяти.
+ */
+int find_entry_by_name(const char *name, uint32_t parent_cluster, DirEntryPosition *entry_pos)
+{
+    if (name == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+    uint8_t *buffer = pool_alloc(fat_info->bytesPerSec);
+    if (buffer == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+    uint32_t current_cluster = parent_cluster;
+    uint32_t address = (current_cluster - fat_info->root_cluster) * fat_info->secPerClus + fat_info->address_region;
+    uint32_t sector = 0, idxEntry = 0;
+    int status = 0;
+
+    FatDir_Type *entry;
+    uint8_t lfn_active = 0;
+    uint8_t check_sum = 0;
+
+    uint8_t idx = 0;
+    uint8_t order = 0;
+    uint32_t length = strlen(name);
+    uint16_t buffer_name[MAX_NAME_SIZE] = {0};
+
+    while (current_cluster != FILE_END_TABLE_FAT32)
+    {
+        address = (current_cluster - fat_info->root_cluster) * fat_info->secPerClus + fat_info->address_region;
+
+        for (sector = 0; sector < fat_info->secPerClus; ++sector)
+        {
+            status = fat_info->device->read(buffer, fat_info->bytesPerSec, address + sector);
+            if (status < 0)
+            {
+                status = FAT_ERR_READ_FAIL;
+                goto cleanup;
+            }
+            for (idxEntry = 0; idxEntry < fat_info->bytesPerSec; idxEntry += sizeof(FatDir_Type))
+            {
+                entry = (FatDir_Type *)&buffer[idxEntry];
+                if (entry->DIR_Name[0] == ENTRY_FREE_FULL_FAT32)
+                {
+                    status = FAT_ERR_ENTRY_NOT_FOUND;
+                    goto cleanup;
+                }
+                else if (entry->DIR_Name[0] == ENTRY_FREE_FAT32)
+                {
+                    if (lfn_active)
+                    {
+                        status = FAT_ERR_ENTRY_CORRUPTED;
+                        goto cleanup;
+                    }
+                    continue;
+                }
+                else if ((entry->DIR_Attr & ATTR_LONG_NAME_MASK) == ATTR_LONG_NAME)
+                {
+                    LDIR_Type *lfn_entry = (LDIR_Type *)entry;
+                    if (lfn_entry->LDIR_Ord & LFN_ENTRY_LAST)
+                        check_sum = lfn_entry->LDIR_Chksum;
+                    if (lfn_entry->LDIR_Type != 0)
+                        continue;
+                    order = lfn_entry->LDIR_Ord & ~LFN_ENTRY_LAST;
+
+                    idx = (order - 1) * MAX_SYMBOLS_ENTRY;
+                    stm_memcpy((uint8_t *)(&buffer_name[idx]), lfn_entry->LDIR_Name1, sizeof(lfn_entry->LDIR_Name1));
+                    idx += sizeof(lfn_entry->LDIR_Name1) / 2;
+                    stm_memcpy((uint8_t *)&buffer_name[idx], lfn_entry->LDIR_Name2, sizeof(lfn_entry->LDIR_Name2));
+                    idx += sizeof(lfn_entry->LDIR_Name2) / 2;
+                    stm_memcpy((uint8_t *)&buffer_name[idx], lfn_entry->LDIR_Name3, sizeof(lfn_entry->LDIR_Name3));
+                    lfn_active = 1;
+                }
+                else
+                {
+                    if (lfn_active)
+                    {
+                        if (ChkSum((uint8_t *)entry->DIR_Name) == check_sum)
+                        {
+                            if (compare_lfn(name, buffer_name) == 0)
+                            {
+                                entry_pos->cluster = parent_cluster;
+                                entry_pos->sector = sector;
+                                entry_pos->offset = (idxEntry / sizeof(LDIR_Type));
+                                status = 0;
+                                goto cleanup;
+                            }
+                        }
+                        lfn_active = 0;
+                        check_sum = 0;
+                        memset(buffer_name, 0x00, sizeof(buffer_name));
+                    }
+                    else if (compare_fat32_sfn(name, length, entry) == 0)
+                    {
+                        entry_pos->cluster = parent_cluster;
+                        entry_pos->sector = sector;
+                        entry_pos->offset = idxEntry / sizeof(FatDir_Type);
+                        status = 0;
+                        goto cleanup;
+                    }
+                }
+            }
+            status = get_next_cluster_fat32(&current_cluster);
+            if (status != 0)
+            {
+                status = FAT_ERR_READ_FAIL;
+                goto cleanup;
+            }
+        }
+    }
+    status = FAT_ERR_ENTRY_NOT_FOUND;
+
+cleanup:
+    if (pool_free_region(buffer, fat_info->bytesPerSec) != 0)
+    {
+        // Вывод в лог
+    }
+    return status;
+}
+
+/**
+ * Инициализирует дескриптор файла FAT32 для работы с файлом.
+ *
+ * @param file_name       Имя файла для открытия.
+ * @param parent_cluster  Кластер родительской директории.
+ * @param mode            Режим доступа: F_READ, F_WRITE или F_APPEND.
+ *
+ * @return Указатель на структуру FAT32_File или NULL при ошибке.
+ */
+FAT32_File *init_file_handle(const char *file_name, uint32_t parent_cluster, uint8_t mode)
+{
+    if (file_name == NULL)
+    {
+        return NULL;
+    }
+
+    // Поиск записи директории по имени файла
+    DirEntryPosition position;
+    int status = find_entry_by_name(file_name, parent_cluster, &position);
+    if (status != 0)
+    {
+        return NULL;
+    }
+
+    // Чтение записи директории по найденной позиции
+    FatDir_Type entry = {0};
+    status = read_directory_entry_fat32(&position, &entry);
+    if (status != 0)
+    {
+        return NULL;
+    }
+
+    // Выделение памяти из пула и инициализация дескриптора
+    FAT32_File *desc = pool_alloc(sizeof(FAT32_File));
+    if (desc == NULL)
+    {
+        return NULL;
+    }
+
+    memset((uint8_t *)desc, 0, sizeof(FAT32_File));
+    join_cluster_number(&desc->first_cluster, entry.DIR_FstClusHI, entry.DIR_FstClusLO);
+    stm_memcpy((uint8_t *)&desc->entry_pos, (uint8_t *)&position, sizeof(DirEntryPosition));
+
+    if (mode == F_READ)
+    {
+        desc->size_bytes = entry.DIR_FileSize;
+        desc->flags = F_READ;
+        status = seek_file_fat32(desc, 0, F_SEEK_SET);
+    }
+    else if (mode == F_WRITE)
+    {
+        // Очистка последующих кластеров, если они есть
+        uint32_t next_cluster = desc->first_cluster;
+        while (1)
+        {
+            status = get_next_cluster_fat32(&next_cluster);
+            if (status != 0)
+            {
+                goto cleanup;
+            }
+
+            if (next_cluster == FILE_END_TABLE_FAT32)
+            {
+                break;
+            }
+
+            status = free_cluster_fat32(next_cluster);
+            if (status != 0)
+            {
+                goto cleanup;
+            }
+        }
+
+        desc->flags = F_WRITE;
+        desc->size_bytes = 0;
+        status = seek_file_fat32(desc, 0, F_SEEK_SET);
+    }
+    else if (mode == F_APPEND)
+    {
+        // Установка позиции в конец файла
+        desc->flags = F_APPEND;
+        desc->size_bytes = entry.DIR_FileSize;
+        status = seek_file_fat32(desc, desc->size_bytes, F_SEEK_SET);
+    }
+    if (status == 0)
+    {
+        return desc;
+    }
+
+cleanup:
+    if (desc != NULL)
+    {
+        if (pool_free_region(desc, sizeof(FAT32_File)) != 0)
+        {
+            // Вывод в лог
+        }
+    }
+    return NULL;
+}
+
+/**
+ * Преобразует структуру времени во внутренний 16-битный формат FAT.
+ *
+ * Формат FAT времени (16 бит):
+ * - Биты 15–11: часы (0–23)
+ * - Биты 10–5 : минуты (0–59)
+ * - Биты 4–0  : секунды, делённые на 2 (0–29, т.е. диапазон 0–58 секунд)
+ *
+ * Значения, выходящие за допустимые пределы, автоматически ограничиваются.
+ *
+ * @param time Указатель на структуру времени TimeType.
+ * @return     16-битное значение, совместимое с форматом FAT. Возвращает 0, если time == NULL.
+ */
+uint16_t convert_time_to_fat(TimeType *time)
+{
+    if (time == NULL)
+        return 0;
+    TimeType safe_time = {0};
+    safe_time.hour = (time->hour > 23 ? 23 : time->hour);
+    safe_time.minute = (time->minute > 59 ? 59 : time->minute);
+    safe_time.second = (time->second > 59 ? 58 : time->second);
+    return (safe_time.hour << 11) | (safe_time.minute << 5) | (safe_time.second / 2);
+}
+
+/**
+ * Преобразует структуру даты во внутренний 16-битный формат FAT.
+ *
+ * Формат FAT даты (16 бит):
+ * - Биты 15–9 : год (начиная с 1980 года, допустимы значения от 1980 до 2107)
+ * - Биты 8–5  : месяц (1–12)
+ * - Биты 4–0  : день месяца (1–31)
+ *
+ * Значения, выходящие за допустимые пределы, автоматически корректируются.
+ *
+ * @param date Указатель на структуру даты DateType.
+ * @return     16-битное значение, совместимое с форматом FAT. Возвращает 0, если date == NULL.
+ */
+uint16_t convert_date_to_fat(DateType *date)
+{
+    if (date == NULL)
+        return 0;
+    DateType safe_date = {0};
+    safe_date.year = (date->year < 1980 ? 1980 : date->year);
+    safe_date.month = (date->month > 12 ? 12 : date->month);
+    safe_date.day = (date->day > 31 ? 31 : date->day);
+
+    return ((safe_date.year - 1980) << 9) | (safe_date.month << 5) | safe_date.day;
+}
+
+int flush_fat32(FAT32_File *file)
+{
+    if (fat_info == NULL || file == NULL)
+        return -1;
+
+    FatDir_Type entry = {0};
+    int status = read_directory_entry_fat32(&file->entry_pos, &entry);
+    if (status != 0)
+        return -2;
+
+    // Обновляем размер файла
+    entry.DIR_FileSize = file->size_bytes;
+
+    DateType date = {0};
+    TimeType time = {0};
+
+    status = get_cur_time_and_date(&date, &time);
+    if (status == 0)
+    {
+        entry.DIR_WrtDate = convert_date_to_fat(&date);
+        entry.DIR_WrtTime = convert_time_to_fat(&time);
+    }
+
+    // Перезаписываем обновлённую запись директории
+    status = write_dir_entries_at(&file->entry_pos, &entry, 1);
+
+    return (status != 0 ? -3 : 0);
+}
+
+int close_file_fat32(FAT32_File **file)
+{
+    if (file == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+
+    // Запись данных на накопитель
+    if (flush_fat32(*file) != 0)
+        return FAT_ERR_FLUSH_FAILED;
+
+    int status = pool_free_region(file, sizeof(FAT32_File));
+    if (status != 0)
+    {
+        // вывод в лог
+    }
+    file = NULL;
+    return 0;
+}
+
+uint32_t tell_fat32(FAT32_File *file)
+{
+    if (file == NULL || fat_info == NULL)
+    {
+        return 0;
+    }
+    uint32_t position = file->position.cluster_idx * fat_info->secPerClus * fat_info->bytesPerSec;
+    position = position + file->position.sector_idx * fat_info->bytesPerSec + file->position.byte_offset;
+    return position;
+}
+
+int read_file_fat32(FAT32_File *file, uint8_t *buffer, uint32_t size)
+{
+    if (file == NULL || buffer == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+    if (fat_info == NULL)
+    {
+        return FAT_ERR_FS_NOT_LOADED;
+    }
+    if (file->flags != F_READ)
+    {
+        return FAT_ERR_INVALID_FILE_MODE;
+    }
+    if (size == 0)
+    {
+        return 0;
+    }
+
+    uint32_t countRBytes = 0;
+    uint32_t sector = file->position.sector_idx;
+    uint8_t *buffer_local = pool_alloc(fat_info->bytesPerSec);
+    if (buffer_local == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+    uint32_t next_cluster = file->position.cluster_number;
+    uint32_t address = fat_info->address_region + (next_cluster - fat_info->root_cluster) * fat_info->secPerClus;
+    uint32_t to_copy = 0;
+    uint16_t shift = file->position.byte_offset;
+    uint32_t bytes_available = 0;
+    int status = 0;
+
+    if (file->size_bytes == 0)
+        return 0;
+    uint32_t position = tell_fat32(file);
+    if (file->size_bytes < (size + position))
+    {
+        size = file->size_bytes - position;
+    }
+
+    while (1)
+    {
+        for (; sector < fat_info->secPerClus; ++sector)
+        {
+            status = fat_info->device->read(buffer_local, fat_info->bytesPerSec, address + sector);
+            if (status < 0)
+            {
+                status = FAT_ERR_READ_FAIL;
+                goto cleanup;
+            }
+
+            bytes_available = fat_info->bytesPerSec - shift;
+            if (size - countRBytes > bytes_available)
+            {
+                to_copy = bytes_available;
+            }
+            else
+            {
+                to_copy = size - countRBytes;
+            }
+
+            stm_memcpy(&buffer[countRBytes], buffer_local + shift, to_copy);
+            countRBytes += to_copy;
+            shift += to_copy;
+
+            if (countRBytes >= size)
+            {
+                file->position.sector_idx = sector;
+                file->position.byte_offset = shift % fat_info->bytesPerSec;
+                status = 0;
+                goto cleanup;
+            }
+            if (shift == fat_info->bytesPerSec)
+            {
+                shift = 0;
+            }
+        }
+
+        sector = 0;
+        status = get_next_cluster_fat32(&next_cluster);
+        if (status != 0 || next_cluster == FILE_END_TABLE_FAT32)
+        {
+            break;
+        }
+        address = fat_info->address_region + (next_cluster - fat_info->root_cluster) * fat_info->secPerClus;
+        file->position.cluster_idx++;
+        file->position.cluster_number = next_cluster;
+    }
+
+    file->position.sector_idx = sector;
+    file->position.byte_offset = shift;
+
+cleanup:
+    if (pool_free_region(buffer_local, fat_info->bytesPerSec))
+    {
+        // вывод в лог
+    }
+    return (status == 0 ? countRBytes : status);
+}
+
+int write_file_fat32(FAT32_File *file, uint8_t *buffer, uint32_t length)
+{
+    if (file == NULL || buffer == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+    if (fat_info == NULL)
+    {
+        return FAT_ERR_FS_NOT_LOADED;
+    }
+    if (length == 0)
+    {
+        return 0;
+    }
+    if (file->flags == F_READ)
+    {
+        return FAT_ERR_INVALID_FILE_MODE;
+    }
+
+    uint32_t countWBytes = 0;
+    uint32_t sector = file->position.sector_idx;
+
+    uint8_t *buffer_local = pool_alloc(fat_info->bytesPerSec);
+    if (buffer_local == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+    uint32_t next_cluster = file->position.cluster_number;
+    uint32_t address = fat_info->address_region + (next_cluster - fat_info->root_cluster) * fat_info->secPerClus;
+    uint32_t to_copy = 0;
+    uint16_t shift = file->position.byte_offset;
+    int status = 0;
+
+    while (1)
+    {
+        for (; sector < fat_info->secPerClus; ++sector)
+        {
+
+            // Чтение сектора в локальный буфер
+            status = fat_info->device->read(buffer_local, fat_info->bytesPerSec, address + sector);
+            if (status < 0)
+            {
+                status = FAT_ERR_READ_FAIL;
+                goto cleanup;
+            }
+
+            // Вычисление количества байт для копирования
+            if (((length - countWBytes) + shift) > fat_info->bytesPerSec)
+            {
+                to_copy = (fat_info->bytesPerSec - shift);
+            }
+            else
+            {
+                to_copy = length - countWBytes;
+            }
+
+            stm_memcpy(buffer_local + shift, &buffer[countWBytes], to_copy);
+            countWBytes += to_copy;
+            shift = 0;
+
+            // Запись сектора обратно
+            status = fat_info->device->write(buffer_local, fat_info->bytesPerSec, address + sector);
+            if (status < 0)
+            {
+                status = FAT_ERR_WRITE_FAIL;
+                goto cleanup;
+            }
+            if (countWBytes >= length)
+            {
+                file->position.sector_idx = sector;
+                file->position.byte_offset = to_copy;
+                file->size_bytes += length;
+                if (pool_free_region(buffer_local, fat_info->bytesPerSec) != 0)
+                {
+                    // лог ошибки освобождения памяти
+                }
+                return countWBytes;
+            }
+        }
+
+        // Переход к следующему кластеру
+        sector = 0;
+        status = extend_cluster_chain_if_needed(&next_cluster);
+        if (status != 0)
+        {
+            goto cleanup;
+        }
+        address = fat_info->address_region + (next_cluster - fat_info->root_cluster) * fat_info->secPerClus;
+        file->position.cluster_idx++;
+        file->position.cluster_number = next_cluster;
+    }
+cleanup:
+    if (pool_free_region(buffer_local, fat_info->bytesPerSec) != 0)
+    {
+        // вывод в лог
+    }
+    return status;
+}
+
+/**
+ * Создаёт новый файл в указанной директории FAT32.
+ *
+ * @param cluster_directory  Кластер директории, в которой создаётся файл.
+ * @param cluster_file       Указатель, в который будет записан номер первого кластера файла.
+ * @param file_name          Имя файла (может быть в формате SFN или LFN).
+ *
+ * @return 0 при успехе или отрицательное значение — при ошибке.
+ */
+int create_file_fat32(uint32_t cluster_directory, uint32_t *cluster_file, char *file_name)
+{
+    int status = 0;
+    uint16_t length = strlen(file_name);
+
+    if (cluster_file == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+
+    *cluster_file = FILE_END_TABLE_FAT32;
+
+    int entry_count = 0;
+    FatDir_Type *entries = NULL;
+
+    // выделяем память(кластер) в таблице для нового файла
+    status = allocate_cluster_fat32(cluster_file);
+    if (status != 0)
+    {
+        return FAT_CLUSTER_ALLOC_FAIL;
+    }
+
+    if (validate_fat_sfn_file(file_name) != 0)
+    {
+        entry_count = ((length + MAX_SYMBOLS_ENTRY) / MAX_SYMBOLS_ENTRY) + 1;
+
+        entries = pool_alloc(sizeof(LDIR_Type) * entry_count);
+        if (entries == NULL)
+        {
+            return POOL_ERR_ALLOCATION_FAILED;
+        }
+
+        FatDir_Type *entry = &entries[entry_count - 1];
+        memset((uint8_t *)entry, 0, sizeof(FatDir_Type));
+        entry->DIR_Attr = ATTR_ARCHIVE;
+
+        split_cluster_number(*cluster_file, &entry->DIR_FstClusHI, &entry->DIR_FstClusLO);
+        generate_sfn_from_lfn(file_name, length, entry->DIR_Name);
+        make_lfn_entries(file_name, length, ChkSum(entry->DIR_Name), (LDIR_Type *)entries, entry_count - 1);
+    }
+    else
+    {
+        entry_count = 1;
+        entries = pool_alloc(sizeof(FatDir_Type));
+        if (entries == NULL)
+        {
+            return POOL_ERR_ALLOCATION_FAILED;
+        }
+        // Ищем и добавляем запись в родительскую директорию
+        FatDir_Type *entry = &entries[0];
+        memset((uint8_t *)entry, 0, sizeof(FatDir_Type));
+
+        entry->DIR_Attr = ATTR_ARCHIVE;
+        split_cluster_number(*cluster_file, &entry->DIR_FstClusHI, &entry->DIR_FstClusLO);
+        format_fat_sfn(file_name, length, entry->DIR_Name);
+    }
+
+    // Найти позицию в директории с нужным количеством свободных записей
+    DirEntryPosition position;
+    status = find_free_dir_entries(cluster_directory, entry_count, &position);
+    if (status != 0)
+    {
+        status = FAT_ERR_NO_FREE_ENTRIES;
+        goto cleanup;
+    }
+    // Записать в корневую директорию
+    status = write_dir_entries_at(&position, entries, entry_count);
+    if (status != 0)
+    {
+        status = FAT_ERR_WRITE_FAIL;
+        goto cleanup;
+    }
+
+cleanup:
+    if (pool_free_region(entries, sizeof(LDIR_Type) * entry_count) != 0)
+    {
+        // вывод в лог
+    }
+    return status;
+}
+
+int open_file_fat32(char *path, FAT32_File **file, uint8_t mode)
+{
+    uint32_t cluster_parent = 0;
+    uint32_t file_cluster;
+    int status = 0;
+
+    if (path == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+
+    if (fat_info == NULL)
+    {
+        return FAT_ERR_FS_NOT_LOADED;
+    }
+
+    // Проверка валидности пути
+    status = validate_path(path);
+    if (status != 0)
+    {
+        return FAT_ERR_PATH_INVALID;
+    }
+
+    // Получаем имя последнего сегмента
+    char file_name[256];
+    status = get_last_path_component(path, file_name);
+    if (status != 0)
+    {
+        return status;
+    }
+
+    // Проверка имени файла на валидность по LFN
+    status = validate_fat_lfn_file(file_name);
+    if (status != 0)
+    {
+        return FAT_ERR_INVALID_CHAR;
+    }
+
+    uint32_t size = strlen(path);
+    char *parent_dir_path = pool_alloc(size);
+    if (parent_dir_path == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+
+    // Извлечение пути родительской директории
+    status = get_dir_path(path, parent_dir_path, size);
+    if (status != 0)
+    {
+        goto cleanup;
+    }
+
+    status = find_directory_fat32(path, &file_cluster);
+    if (status == 0)
+    {
+        status = find_directory_fat32(parent_dir_path, &cluster_parent);
+        if (status != 0)
+        {
+            goto cleanup;
+        }
+        // загрузить данные в дескриптор
+        *file = init_file_handle(file_name, cluster_parent, mode);
+        if (file == NULL)
+        {
+            status = FAT_ERR_OPEN_FAILED;
+        }
+        else
+        {
+            status = 0;
+        }
+        goto cleanup;
+    }
+
+    status = find_directory_fat32(parent_dir_path, &cluster_parent);
+    if (status != 0)
+    {
+        status = FAT_ERR_PATH_INVALID;
+        goto cleanup;
+    }
+
+    status = create_file_fat32(cluster_parent, &file_cluster, file_name);
+    if (status != 0)
+    {
+        status = FAT_ERR_CREATE_FAILED;
+        goto cleanup;
+    }
+
+    *file = init_file_handle(file_name, cluster_parent, mode);
+    if (*file != NULL)
+    {
+        status = 0;
+    }
+    else
+    {
+        status = FAT_ERR_OPEN_FAILED;
+    }
+cleanup:
+    if (pool_free_region(parent_dir_path, size) != 0)
+    {
+        // Вывод в лог
+    }
+    return status;
+}
+
+int mkdir_fat32(char *path)
+{
+    if (path == NULL)
+        return FAT_ERR_INVALID_ARGUMENT;
+
+    if (fat_info == NULL)
+    {
+        return FAT_ERR_FS_NOT_LOADED;
+    }
+
+    // Проверка корректности формата пути
+    uint32_t cluster_dir = 0;
+    int status = validate_path(path);
+    if (status != 0)
+    {
+        return FAT_ERR_PATH_INVALID;
+    }
+
+    // Получаем имя новой директории
+    char file_name[MAX_NAME_SIZE];
+    memset(file_name, '0', MAX_NAME_SIZE);
+    status = get_last_path_component(path, file_name);
+    if (status != 0)
+    {
+        return FAT_ERR_INVALID_PATH;
+    }
+
+    // Проверка имени директории
+    status = validate_fat_lfn_dir(file_name);
+    if (status != 0)
+    {
+        return FAT_ERR_INVALID_CHAR;
+    }
+
+    uint32_t size = strlen(path);
+    char *dir_path = pool_alloc(size);
+    if (dir_path == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+
+    // Получаем путь к родительской директории
+    status = get_dir_path(path, dir_path, size);
+    if (status != 0)
+    {
+        status = FAT_ERR_PATH_INVALID;
+        goto cleanup;
+    }
+
+    if (path_exists_fat32(path) == 0)
+    {
+        status = 0;
+        goto cleanup;
+    }
+
+    status = find_directory_fat32(dir_path, &cluster_dir);
+    if (status != 0)
+    {
+        status = FAT_ERR_DIR_NOT_FOUND;
+        goto cleanup;
+    }
+    status = create_dir_fat32(file_name, strlen(file_name), cluster_dir);
+    if (status != 0)
+    {
+        status = FAT_ERR_CREATE_FAILED;
+    }
+cleanup:
+    if (pool_free_region(dir_path, size) != 0)
+    {
+        // Вывод в лог
+    }
+    return status;
+}
+
+/**
+ * Преобразует имя файла в формат FAT 8.3 (SFN) и записывает его в буфер длиной 11 байт.
+ *
+ * Формат:
+ * - Первые 8 символов — имя файла, пробелами дополняется до 8 байт.
+ * - Следующие 3 символа — расширение (если есть), также дополняется пробелами.
+ *
+ * @param input   Строка с именем файла (например, "file.txt").
+ * @param length  Длина строки input.
+ * @param output  Буфер из 11 байт для результата (8 байт имени + 3 байта расширения).
+ */
+void format_fat_sfn(const char *input, uint16_t length, char output[11])
+{
+    if (input == NULL || output == NULL)
+    {
+        return;
+    }
+    int idx = 0;
+    for (idx = 0; idx < 11; ++idx)
+        output[idx] = ' ';
+
+    for (idx = 0; idx < 8 && input[idx] != '.' && idx < length; ++idx)
+    {
+        output[idx] = toupper(input[idx]);
+    }
+    if (input[idx] == '.' && idx < length)
+    {
+        for (int j = 8; j < 11; ++j)
+        {
+            output[j] = toupper(input[++idx]);
+        }
+    }
+}
+
+/**
+ * Разделяет 32-битный номер кластера на две 16-битные части: старшую и младшую.
+ *
+ * Это необходимо при работе с файловой системой FAT32, где номер кластера
+ * хранится в двух полях: DIR_FstClusHI (старшие 16 бит) и DIR_FstClusLO (младшие 16 бит).
+ *
+ * @param cluster  Полный 32-битный номер кластера.
+ * @param[out] high Указатель на переменную, куда будет записана старшая 16-битная часть.
+ * @param[out] low  Указатель на переменную, куда будет записана младшая 16-битная часть.
+ */
+void split_cluster_number(uint32_t cluster, uint16_t *high, uint16_t *low)
+{
+    if (low == NULL || high == NULL)
+        return;
+    *low = cluster & 0xFFFF;
+    *high = (cluster >> 16) & 0xFFFF;
+}
+
+/**
+ * Объединяет два 16-битных значения (старшую и младшую части) в одно 32-битное значение кластера.
+ *
+ * Эта функция используется в FAT32 для объединения двух полей из записи директории:
+ * - DIR_FstClusHI (старшие 16 бит номера кластера)
+ * - DIR_FstClusLO (младшие 16 бит номера кластера)
+ *
+ * @param cluster Указатель на переменную, в которую будет записан полный номер кластера.
+ * @param high    Старшие 16 бит номера кластера.
+ * @param low     Младшие 16 бит номера кластера.
+ */
+void join_cluster_number(uint32_t *cluster, uint16_t high, uint16_t low)
+{
+    if (cluster == NULL)
+        return;
+    *cluster = ((uint32_t)high << 16) | ((uint32_t)low << 0);
+}
+
+/**
+ * Поиск свободного кластера в FAT-таблице.
+ *
+ * Эта функция сканирует FAT-таблицу, читая её сектора по одному, и ищет первый свободный кластер,
+ * помеченный как FREE_CLUSTER.
+ *
+ * @param[out] free_cluster Указатель на переменную, в которую будет записан номер найденного свободного кластера.
+ *                          В случае ошибки или если свободный кластер не найден, значение будет FILE_END_TABLE_FAT32.
+ *
+ * @return 0 при успешном поиске,
+ *         FAT_ERR_INVALID_ARGUMENT, если передан NULL-указатель,
+ *         FAT_ERR_FS_NOT_LOADED, если файловая система не инициализирована,
+ *         POOL_ERR_ALLOCATION_FAILED, если не удалось выделить буфер,
+ *         FAT_ERR_READ_FAIL, если не удалось прочитать сектор FAT,
+ *         либо ненулевое значение в случае других ошибок.
+ */
+int find_free_cluster(uint32_t *free_cluster)
+{
+    int status = 0;
+    if (free_cluster == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+
+    *free_cluster = FILE_END_TABLE_FAT32;
+
+    if (fat_info == NULL)
+        return FAT_ERR_FS_NOT_LOADED;
+
+    uint32_t *buffer = pool_alloc(fat_info->bytesPerSec);
+    if (buffer == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+
+    int sector = 0, idx = 0;
+
+    do
+    {
+        status = fat_info->device->read((uint8_t *)buffer, fat_info->bytesPerSec, fat_info->address_tabl1 + sector);
+        if (status < 0)
+        {
+            return FAT_ERR_READ_FAIL;
+        }
+        for (idx = 0; idx < fat_info->bytesPerSec; ++idx)
+        {
+            if (buffer[idx] == FREE_CLUSTER)
+            {
+                *free_cluster = sector * fat_info->fat_ents_sec + idx;
+                status = 0;
+                goto cleanup;
+            }
+        }
+    } while (++sector < fat_info->sizeFAT);
+
+cleanup:
+    if (pool_free_region(buffer, fat_info->bytesPerSec) != 0)
+    {
+        // вывод в лог
+    }
+    return status;
+}
+
+/**
+ * Обновляет запись в таблице FAT32 для указанного кластера в обеих копиях FAT.
+ *
+ * Функция сначала изменяет FAT1, затем FAT2. Если обновление второй копии (FAT2) не удалось,
+ * FAT1 останется обновлённой, что приведёт к частичной неконсистентности.
+ * В случае ошибки пользователь обязан сам обработать откат снаружи.
+ *
+ * @param cluster Номер кластера для обновления.
+ * @param value Значение, которое будет записано (например, номер следующего кластера или EOF).
+ *
+ * @return 0 — успех,
+ *         FAT_ERR_INVALID_ARGUMENT — некорректный указатель fat_info,
+ *         POOL_ERR_ALLOCATION_FAILED — не удалось выделить память из пула,
+ *         FAT_ERR_UPDATE_FAILED — ошибка при работе с FAT1,
+ *         FAT_ERR_UPDATE_PARTIAL_FAIL — FAT1 обновлена, FAT2 — нет (требуется откат на стороне вызывающего кода).
+ */
+int update_fat32(uint32_t cluster, uint32_t value)
+{
+    if (fat_info == NULL)
+        return FAT_ERR_INVALID_ARGUMENT;
+
+    uint32_t sector = ((uint32_t)cluster / fat_info->fat_ents_sec);
+    uint32_t *buffer = pool_alloc(fat_info->bytesPerSec);
+    int status = 0;
+
+    if (buffer == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+
+    status = fat_info->device->read((uint8_t *)buffer, fat_info->bytesPerSec, fat_info->address_tabl1 + sector);
+    if (status < 0)
+    {
+        status = FAT_ERR_UPDATE_FAILED;
+        goto update_failed;
+    }
+    uint32_t idx_entry = (uint32_t)(cluster % fat_info->fat_ents_sec);
+
+    buffer[idx_entry] = value;
+    status = fat_info->device->write((uint8_t *)buffer, fat_info->bytesPerSec, fat_info->address_tabl1 + sector);
+    if (status < 0)
+    {
+        status = FAT_ERR_UPDATE_FAILED;
+        goto update_failed;
+    }
+
+    status = fat_info->device->read((uint8_t *)buffer, fat_info->bytesPerSec, fat_info->address_tabl2 + sector);
+    if (status < 0)
+    {
+        pool_free_region(buffer, fat_info->bytesPerSec);
+        return FAT_ERR_UPDATE_PARTIAL_FAIL;
+    }
+
+    buffer[idx_entry] = value;
+    status = fat_info->device->write((uint8_t *)buffer, fat_info->bytesPerSec, fat_info->address_tabl2 + sector);
+    if (status < 0)
+    {
+        pool_free_region(buffer, fat_info->bytesPerSec);
+        return FAT_ERR_UPDATE_PARTIAL_FAIL;
+    }
+
+update_failed:
+    if (status == 0)
+    {
+    }
+    status = pool_free_region((uint8_t *)buffer, fat_info->bytesPerSec);
+    if (status != 0)
+    {
+        // вывод в лог
+    }
+
+    return status;
+}
+
+/**
+ * Получает следующий кластер в цепочке FAT32.
+ *
+ * @param prev_cluster [in, out] - указатель на текущий кластер; при успешном завершении
+ *                                будет обновлен на следующий кластер.
+ * @return 0 при успехе,
+ *         FAT_ERR_INVALID_ARGUMENT если fat_info не инициализирован,
+ *         POOL_ERR_ALLOCATION_FAILED при ошибке выделения памяти.
+ */
+int get_next_cluster_fat32(uint32_t *prev_cluster)
+{
+    if (fat_info == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+    int status = 0;
+    uint32_t address = fat_info->address_tabl1 + *prev_cluster / fat_info->fat_ents_sec;
+    uint32_t *buffer = pool_alloc(fat_info->bytesPerSec);
+    if (buffer == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+    status = fat_info->device->read((uint8_t *)buffer, fat_info->bytesPerSec, address);
+    if (status < 0)
+    {
+        status = FAT_ERR_READ_FAIL;
+        goto cleanup;
+    }
+    uint32_t idx_entry = (uint32_t)(*prev_cluster % fat_info->fat_ents_sec);
+    *prev_cluster = buffer[idx_entry];
+
+cleanup:
+    if (pool_free_region(buffer, fat_info->bytesPerSec) != 0)
+    {
+        // вывод в Лог
+    }
+    return status;
+}
+
+/**
+ * Выделяет свободный кластер и помечает его концом цепочки (EOF) в таблице FAT.
+ *
+ * @param new_cluster Указатель, по которому будет записан номер выделенного кластера.
+ * @return 0 при успехе,
+ *         FAT_ERR_INVALID_ARGUMENT — если аргумент NULL,
+ *         FAT_ERR_DISK_FULL — если свободный кластер не найден,
+ *         FAT_ERR_UPDATE_FAILED — если не удалось записать в обе FAT-таблицы,
+ *         FAT_ERR_UPDATE_PARTIAL_FAIL — если запись прошла только в одну таблицу, но откат удался,
+ *         FAT_ERR_RECOVERY_FAILED — если не удалось выполнить откат после частичной записи.
+ */
+int allocate_cluster_fat32(uint32_t *new_cluster)
+{
+    int status = 0;
+    if (new_cluster == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+
+    // Поиск первого свободного кластера
+    status = find_free_cluster(new_cluster);
+    if (status != 0)
+    {
+        return status;
+    }
+    else if (*new_cluster == FILE_END_TABLE_FAT32)
+    {
+        return FAT_ERR_DISK_FULL;
+    }
+
+    // Обновляем информацию в таблицах FAT
+    status = update_fat32(*new_cluster, FILE_END_TABLE_FAT32);
+    if (status == FAT_ERR_UPDATE_PARTIAL_FAIL)
+    {
+        status = update_fat32(*new_cluster, NOT_USED_CLUSTER_FAT32);
+        if (status == FAT_ERR_UPDATE_FAILED)
+        {
+            return FAT_ERR_UPDATE_PARTIAL_FAIL;
+        }
+        else
+        {
+            status = FAT_ERR_UPDATE_FAILED;
+        }
+    }
+    return (status == 0 ? 0 : FAT_ERR_UPDATE_FAILED);
+}
+
+/**
+ * Проверяет, существует ли следующий кластер в цепочке,
+ * и при необходимости выделяет новый кластер, расширяя цепочку.
+ *
+ * @param last_cluster Указатель на текущий (последний) кластер в цепочке.
+ *                     При успешном расширении обновляется на следующий кластер.
+ *
+ * @return 0 при успехе (либо если кластер уже продолжен, либо если выделен новый),
+ *         FAT_ERR_INVALID_ARGUMENT — если аргумент некорректен,
+ *         FAT_ERR_DISK_FULL — если не удалось найти свободный кластер,
+ *         FAT_ERR_UPDATE_FAILED — ошибка обновления FAT,
+ *         FAT_ERR_UPDATE_PARTIAL_FAIL — если FAT обновлена частично,
+ *         FAT_ERR_RECOVERY_FAILED — если откат не удался.
+ */
+int extend_cluster_chain_if_needed(uint32_t *last_cluster)
+{
+    uint32_t cluster_next = *last_cluster;
+    if (last_cluster == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+
+    // Ищем следующий кластер в цепочке
+    int status = get_next_cluster_fat32(&cluster_next);
+    if (status == 0 && cluster_next != FILE_END_TABLE_FAT32)
+    {
+        *last_cluster = cluster_next;
+        return 0;
+    }
+
+    // Если кластер не найден, добавляем новый кластер
+    cluster_next = *last_cluster;
+    status = allocate_cluster_fat32(&cluster_next);
+    if (status == 0)
+    {
+        *last_cluster = cluster_next;
+        return 0;
+    }
+    return status;
+}
+
+/**
+ * Проверяет, является ли запись в каталоге FAT32 свободной.
+ *
+ * @param entry Указатель на структуру записи каталога FAT32 (FatDir_Type).
+ * @return 0 — если запись свободна,
+ *         1 — если запись занята,
+ *        FAT_ERR_INVALID_ARGUMENT — если передан NULL-указатель.
+ *
+ * Свободные записи определяются по первому байту имени:
+ *   - 0x00 (ENTRY_FREE_FAT32) — запись никогда не использовалась.
+ *   - 0xE5 (ENTRY_FREE_FULL_FAT32) — запись удалена.
+ */
+int is_free_entry_fat32(FatDir_Type *entry)
+{
+    if (entry == NULL)
+        return FAT_ERR_INVALID_ARGUMENT;
+
+    if (entry->DIR_Name[0] == ENTRY_FREE_FAT32 || entry->DIR_Name[0] == ENTRY_FREE_FULL_FAT32)
+    {
+        return 0;
+    }
+    return 1;
+}
+
+int path_exists_fat32(char *path)
+{
+    uint32_t cluster = 0;
+    if (path == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+    return (find_directory_fat32(path, &cluster) == 0 ? 0 : 1);
+}
+
+/**
+ * @brief Генерация SFN (короткого имени 8.3) на основе длинного имени (LFN)
+ *
+ * Эта функция используется для создания псевдонима в формате 8.3 (Short File Name),
+ * который сохраняется в основной (последней) записи директории при использовании LFN.
+ * Имя формируется из первых символов до точки, добавляется суффикс ~1, и
+ * при наличии расширения копируются первые 3 символа расширения.
+ *
+ * @param lfn_name Указатель на длинное имя файла (LFN)
+ * @param length   Длина длинного имени
+ * @param sfn      Буфер (11 байт), в который будет записано короткое имя (SFN)
+ */
+void generate_sfn_from_lfn(char *name, uint32_t length, uint8_t buffer[11])
+{
+    if (name == NULL || buffer == NULL)
+    {
+        return;
+    }
+
+    memset(buffer, ' ', SHORT_NAME_SIZE);
+    char *dot = find_last_char(name, '.');
+
+    uint16_t ext_len = (dot != NULL ? (name + length) - dot : 0);
+    uint16_t base_len = (dot != NULL ? (length - (dot - name + 1)) : 0);
+    uint16_t idx = 0;
+
+    for (idx = 0; idx < LFN_SHORT_NAME && idx < base_len; ++idx)
+    {
+        if (!(isalpha(buffer[idx]) || isdigit(buffer[idx])))
+            buffer[idx] = toupper(name[idx]);
+    }
+    buffer[6] = '~';
+    buffer[7] = '1';
+    if (dot != NULL && ext_len > 0)
+    {
+        for (idx = 0; idx < 3 && idx < ext_len; ++idx)
+        {
+            buffer[8 + idx] = toupper(dot[1 + idx]);
+        }
+    }
+}
+
+/**
+ * @brief Заполняет поля имени в LFN-структуре (Long File Name) символами UTF-16.
+ *
+ * FAT LFN-записи хранят до 13 символов UTF-16:
+ *
+ * Эта функция копирует заданные символы в соответствующие поля структуры.
+ * Если длина меньше 13, оставшиеся позиции заполняются 0xFFFF (указание на конец строки).
+ *
+ * @param entry        Указатель на структуру LDIR_Type, которую нужно заполнить.
+ * @param utf16_chunk  Указатель на массив UTF-16 символов (не более 13).
+ * @param length       Количество символов в utf16_chunk (от 0 до 13).
+ */
+void fill_lfn_name_fields(LDIR_Type *entry, const uint16_t *utf16_chunk, uint8_t length)
+{
+    int idx = 0;
+    uint16_t *lfn_fields[MAX_SYMBOLS_ENTRY] = {0};
+
+    for (idx = 0; idx < 5; ++idx)
+        lfn_fields[idx] = (uint16_t *)&entry->LDIR_Name1[idx * 2];
+    for (idx = 0; idx < 6; ++idx)
+        lfn_fields[idx + 5] = (uint16_t *)&entry->LDIR_Name2[idx * 2];
+    for (idx = 0; idx < 2; ++idx)
+        lfn_fields[idx + 11] = (uint16_t *)&entry->LDIR_Name3[idx * 2];
+
+    for (idx = 0; idx < MAX_SYMBOLS_ENTRY; ++idx)
+    {
+        if (idx < length)
+        {
+            *lfn_fields[idx] = utf16_chunk[idx];
+        }
+        else
+        {
+            *lfn_fields[idx] = 0xFFFF;
+        }
+    }
+}
+
+/**
+ * @brief Создаёт LFN-записи (Long File Name) для длинного имени файла.
+ *
+ * FAT LFN хранит длинные имена в нескольких 13-символьных записях,
+ * каждая из которых является структурой LDIR_Type.
+ *
+ * @param name          Исходное имя файла в ASCII.
+ * @param length        Длина имени файла (в байтах).
+ * @param chkSum        Контрольная сумма короткого имени (SFN), используемая в LFN-записях.
+ * @param entries       Указатель на массив LDIR_Type для записи LFN-записей.
+ * @param numb_entries  Количество LFN-записей (обычно вычисляется как ceil(length/13)).
+ *
+ * @return 0 при успехе, код ошибки при неудаче.
+ */
+int make_lfn_entries(const char *name, uint32_t length, uint8_t chkSum, LDIR_Type *entries, uint16_t numb_entries)
+{
+    if (entries == NULL || name == NULL)
+        return FAT_ERR_INVALID_ARGUMENT;
+
+    int idx = 0;
+    uint32_t size_buffer = length + 1;
+    uint16_t *name_utf16le = pool_alloc(size_buffer * sizeof(uint16_t));
+    if (name_utf16le == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+
+    LDIR_Type *entry = NULL;
+
+    ascii_to_utf16le(name, (uint8_t *)name_utf16le);
+
+    for (idx = 0; idx < numb_entries; ++idx)
+    {
+        entry = &entries[numb_entries - idx - 1];
+        entry->LDIR_Attr = ATTR_LONG_NAME;
+        entry->LDIR_FstClusLO = 0;
+        entry->LDIR_Type = 0;
+        entry->LDIR_Chksum = chkSum;
+        entry->LDIR_Ord = idx + 1;
+        fill_lfn_name_fields(entry, name_utf16le + (idx * LFN_NAME_LENGTH), size_buffer - (idx * LFN_NAME_LENGTH));
+    }
+
+    // Помечаем первую (последнюю в физическом порядке) LFN-запись как последнюю (бит 0x40 в LDIR_Ord)
+    entries[0].LDIR_Ord |= LFN_ENTRY_LAST;
+
+    if (pool_free_region(name_utf16le, size_buffer * sizeof(uint16_t)))
+    {
+        // вывод в лог
+    }
+    return 0;
+}
+
+/**
+ * @brief Ищет свободную последовательность записей в каталоге для размещения файла или LFN-записей.
+ *
+ * Функция сканирует кластер(ы) каталога, чтобы найти подряд идущие `entry_count` свободных записей (32-байтных),
+ * необходимых для размещения длинного имени файла (LFN) + основной SFN-записи.
+ * Если свободных записей нет — цепочка кластеров расширяется.
+ *
+ * @param parent_cluster Кластер родительского каталога.
+ * @param entry_count    Количество необходимых подряд идущих записей (обычно 1 + кол-во LFN записей).
+ * @param position       Указатель на структуру, куда будет записано положение свободных записей.
+ *
+ * @return 0 при успехе, либо код ошибки (например, FAT_ERR_DISK_FULL).
+ */
+int find_free_dir_entries(uint32_t parent_cluster, const uint16_t entry_count, DirEntryPosition *position)
+{
+    if (position == NULL)
+        return FAT_ERR_INVALID_ARGUMENT;
+    if (fat_info == NULL)
+    {
+        return FAT_ERR_FS_NOT_LOADED;
+    }
+
+    uint32_t address = 0;
+    uint8_t *buffer = pool_alloc(fat_info->bytesPerSec);
+    if (buffer == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+
+    uint32_t free_sectors = 0;
+    int status = 1;
+    int sector, idx;
+    while (1)
+    {
+        free_sectors = 0;
+        address = (parent_cluster - fat_info->root_cluster) * fat_info->secPerClus + fat_info->address_region;
+        for (sector = 0; sector < fat_info->secPerClus; ++sector)
+        {
+            status = fat_info->device->read(buffer, fat_info->bytesPerSec, address + sector);
+            if (status < 0)
+            {
+                status = FAT_ERR_READ_FAIL;
+                goto cleanup;
+            }
+            for (idx = 0; idx < fat_info->bytesPerSec; idx += sizeof(LDIR_Type))
+            {
+                if (is_free_entry_fat32((FatDir_Type *)&buffer[idx]) == 0)
+                {
+                    if (++free_sectors == entry_count)
+                    {
+                        position->cluster = parent_cluster;
+                        uint16_t count_entries_sec = (fat_info->bytesPerSec / sizeof(LDIR_Type));
+                        uint16_t current_entry = sector * count_entries_sec + (idx / sizeof(LDIR_Type));
+                        position->sector = (current_entry - entry_count) / (count_entries_sec);
+                        position->offset = (current_entry + 1) - entry_count;
+                        status = 0;
+                        goto cleanup;
+                    }
+                }
+                else
+                {
+                    free_sectors = 0;
+                }
+            }
+        }
+        free_sectors = 0;
+        status = extend_cluster_chain_if_needed(&parent_cluster);
+        if (status != 0)
+        {
+            // Если не осталось свободных кластеров, тогда очищаем запись для новый кластера
+            update_fat32(parent_cluster, FREE_CLUSTER);
+            status = FAT_ERR_DISK_FULL;
+            goto cleanup;
+        }
+    }
+cleanup:
+    if (pool_free_region(buffer, fat_info->bytesPerSec) != 0)
+    {
+        // Вывод в лог
+    }
+    return status;
+}
+
+/**
+ * @brief Записывает записи каталога (LFN + SFN) начиная с заданной позиции.
+ *
+ * @param position     Позиция в каталоге, куда нужно записывать.
+ * @param entries      Указатель на массив записей (структуры LDIR_Type / FatDir_Type).
+ * @param entry_count  Количество записей для записи.
+ *
+ * @return 0 при успехе, иначе код ошибки.
+ */
+int write_dir_entries_at(const DirEntryPosition *position, const void *entries, uint16_t entry_count)
+{
+    if (position == NULL || entries == NULL)
+        return FAT_ERR_INVALID_ARGUMENT;
+    if (fat_info == NULL)
+    {
+        return FAT_ERR_FS_NOT_LOADED;
+    }
+
+    uint8_t *buffer = pool_alloc(fat_info->bytesPerSec);
+    if (buffer == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+
+    memset(buffer, 0, fat_info->bytesPerSec);
+    uint16_t entries_written = 0;
+    uint32_t address = (position->cluster - fat_info->root_cluster) * fat_info->secPerClus + fat_info->address_region;
+    int status = 0;
+
+    uint16_t to_copy = 0;
+    int sector = position->sector;
+
+    uint16_t count_entries_sector = fat_info->bytesPerSec / sizeof(LDIR_Type);
+    if (position->offset != 0)
+    {
+        if (fat_info->device->read(buffer, fat_info->bytesPerSec, address + sector) < 0)
+        {
+            status = FAT_ERR_READ_FAIL;
+            goto cleanup;
+        };
+
+        if (entry_count > (count_entries_sector - position->offset))
+        {
+            to_copy = entry_count - (count_entries_sector - position->offset);
+        }
+        else
+        {
+            to_copy = entry_count;
+        }
+
+        stm_memcpy(buffer + position->offset * sizeof(LDIR_Type), (uint8_t *)entries, to_copy * sizeof(LDIR_Type));
+        if (fat_info->device->write(buffer, fat_info->bytesPerSec, address + sector) < 0)
+        {
+            status = FAT_ERR_WRITE_FAIL;
+            goto cleanup;
+        }
+        ++sector;
+        entries_written += to_copy;
+    }
+
+    for (; sector < fat_info->secPerClus && entries_written < entry_count; ++sector)
+    {
+        if (fat_info->device->read(buffer, fat_info->bytesPerSec, address + sector) < 0)
+        {
+            status = FAT_ERR_READ_FAIL;
+            goto cleanup;
+        };
+        to_copy = count_entries_sector;
+        if (entries_written + to_copy > entry_count)
+        {
+            to_copy = entry_count - entries_written;
+        }
+        stm_memcpy(buffer, (const uint8_t *)(entries + entries_written), to_copy * sizeof(LDIR_Type));
+        if (fat_info->device->write(buffer, fat_info->bytesPerSec, address + sector) < 0)
+        {
+            status = FAT_ERR_WRITE_FAIL;
+            goto cleanup;
+        };
+        entries_written += to_copy;
+    }
+cleanup:
+    if (pool_free_region(buffer, fat_info->bytesPerSec) != 0)
+    {
+        // Вывод в лог
+    }
+    return status;
+}
+
+/**
+ * @brief Создаёт новую директорию в FAT32.
+ *
+ * @param name            Имя директории (LFN или SFN).
+ * @param length          Длина имени.
+ * @param parent_cluster  Кластер родительской директории.
+ * @return 0 при успехе, иначе код ошибки.
+ */
+int create_dir_fat32(char *name, uint32_t length, uint32_t parent_cluster)
+{
+    int status = 0;
+    uint32_t cluster_new_dir = 0;
+
+    int entry_count = 0;
+    FatDir_Type *entries = NULL;
+
+    if (name == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+
+    // выделяем память в таблице для новой директории
+    status = allocate_cluster_fat32(&cluster_new_dir);
+    if (status != 0)
+    {
+        return FAT_CLUSTER_ALLOC_FAIL;
+    }
+    FatDir_Type *entry = NULL;
+    if (validate_fat_sfn_dir(name) == 0)
+    {
+        entry_count = ((length + MAX_SYMBOLS_ENTRY) / MAX_SYMBOLS_ENTRY) + 1;
+
+        entries = pool_alloc(sizeof(LDIR_Type) * entry_count);
+        if (entries == NULL)
+        {
+            return POOL_ERR_ALLOCATION_FAILED;
+        }
+        entry = &entries[entry_count - 1];
+        memset((uint8_t *)entry, 0, sizeof(FatDir_Type));
+
+        split_cluster_number(cluster_new_dir, &entry->DIR_FstClusHI, &entry->DIR_FstClusLO);
+        generate_sfn_from_lfn(name, length, entry->DIR_Name);
+        make_lfn_entries(name, length, ChkSum(entry->DIR_Name), (LDIR_Type *)entries, entry_count - 1);
+    }
+    else
+    {
+        entry_count = 1;
+        entries = pool_alloc(sizeof(FatDir_Type));
+        if (entries == NULL)
+        {
+            return POOL_ERR_ALLOCATION_FAILED;
+        }
+        // Ищем и добавляем запись в родительскую директорию
+        entry = &entries[0];
+        memset((uint8_t *)entry, 0, sizeof(FatDir_Type));
+
+        split_cluster_number(cluster_new_dir, &entry->DIR_FstClusHI, &entry->DIR_FstClusLO);
+        format_fat_sfn(name, length, entry->DIR_Name);
+    }
+
+    DateType date = {0};
+    TimeType time = {0};
+
+    status = get_cur_time_and_date(&date, &time);
+    entry->DIR_Attr = ATTR_DIRECTORY;
+    if (status == 0)
+    {
+        entry->DIR_CrtDate = convert_date_to_fat(&date);
+        entry->DIR_CrtTime = convert_time_to_fat(&time);
+        entry->DIR_CrtTimeTenth = 0;
+        entry->DIR_WrtDate = entry->DIR_CrtDate;
+        entry->DIR_WrtTime = entry->DIR_CrtTime;
+        entry->DIR_LstAccDate = entry->DIR_CrtDate;
+    }
+
+    // Поиск свободного места в директории
+    DirEntryPosition position;
+    status = find_free_dir_entries(parent_cluster, entry_count, &position);
+    if (status != 0)
+    {
+        status = FAT_ERR_NO_FREE_ENTRIES;
+        goto cleanup;
+    }
+    // Записать в корневую директорию
+    status = write_dir_entries_at(&position, entries, entry_count);
+    if (status != 0)
+    {
+        status = FAT_ERR_WRITE_FAIL;
+        goto cleanup;
+    }
+
+    // Создаем entries для новой папки
+
+    FatDir_Type dir_entries[2];
+    memset((uint8_t *)dir_entries, 0, sizeof(FatDir_Type) * 2);
+
+    dir_entries[0].DIR_Attr = dir_entries[1].DIR_Attr = ATTR_DIRECTORY;
+    dir_entries[0].DIR_FileSize = dir_entries[1].DIR_FileSize = 0;
+
+    memset(dir_entries[0].DIR_Name, ' ', sizeof(dir_entries[0].DIR_Name));
+    memset(dir_entries[1].DIR_Name, ' ', sizeof(dir_entries[0].DIR_Name));
+    stm_memcpy(dir_entries[0].DIR_Name, (uint8_t *)"..", 2);
+    stm_memcpy(dir_entries[1].DIR_Name, (uint8_t *)".", 1);
+
+    split_cluster_number(position.cluster, &dir_entries[0].DIR_FstClusHI, &dir_entries[0].DIR_FstClusLO);
+    split_cluster_number(cluster_new_dir, &dir_entries[1].DIR_FstClusHI, &dir_entries[1].DIR_FstClusLO);
+
+    position.cluster = cluster_new_dir;
+    position.offset = 0;
+    position.sector = 0;
+
+    status = write_dir_entries_at(&position, dir_entries, 2);
+    if (status != 0)
+    {
+        status = FAT_ERR_WRITE_FAIL;
+        goto cleanup;
+    }
+
+cleanup:
+    if (pool_free_region(entries, sizeof(LDIR_Type) * entry_count) != 0)
+    {
+        // Вывод в лог
+    }
+
+    return status;
+}
+
+/**
+ * @brief Удаляет цепочку кластеров, связанных с файлом или директорией в FAT32.
+ *
+ * Освобождает все кластеры, начиная с переданного `cluster_file`, путём последовательного
+ * чтения следующего кластера через FAT и пометки текущего как свободного (FREE_CLUSTER).
+ *
+ * @param cluster_file Начальный кластер файла или директории, которую требуется удалить.
+ * @return int Код ошибки или 0 при успешном завершении:
+ *  - FAT_ERR_FS_NOT_LOADED — если файловая система не инициализирована.
+ *  - FAT_ERR_INVALID_CLUSTER — если передан некорректный номер кластера.
+ *  - FAT_ERR_READ_FAIL — если не удалось прочитать следующий кластер.
+ *  - FAT_ERR_WRITE_FAIL — если не удалось обновить FAT.
+ *  - FAT_ERR_INVALID_CLUSTER_CHAIN — если цепочка повреждена (бесконечный цикл).
+ */
+int delete_entry_fat32(uint32_t cluster_file)
+{
+    if (fat_info == NULL)
+    {
+        return FAT_ERR_FS_NOT_LOADED;
+    }
+    if (cluster_file < 2 || cluster_file >= FILE_END_TABLE_FAT32)
+    {
+        return FAT_ERR_INVALID_CLUSTER;
+    }
+    uint32_t next_cluster = cluster_file;
+    int status = 0;
+    while (cluster_file < FILE_END_TABLE_FAT32)
+    {
+        status = get_next_cluster_fat32(&next_cluster);
+        if (status != 0)
+        {
+            return FAT_ERR_READ_FAIL;
+        }
+
+        status = update_fat32(cluster_file, FREE_CLUSTER);
+        if (status != 0)
+        {
+            return FAT_ERR_WRITE_FAIL;
+        }
+        if (cluster_file == next_cluster)
+        {
+            return FAT_ERR_INVALID_CLUSTER_CHAIN;
+        }
+
+        cluster_file = next_cluster;
+    };
+    return 0;
+}
+
+int is_special_dir(char dir_name[11])
+{
+    if (dir_name[0] == '.' && dir_name[1] == ' ')
+        return 0;
+
+    if (dir_name[0] == '.' && dir_name[1] == '.')
+        return 0;
+    return -1;
+}
+
+/**
+ * @brief Рекурсивно удаляет директорию и всё её содержимое (файлы и поддиректории) в FAT32.
+ *
+ * @param cluster Кластер директории, которую необходимо удалить.
+ * @return int 0 при успехе, либо отрицательный код ошибки:
+ *  - FAT_ERR_FS_NOT_LOADED — если файловая система не инициализирована.
+ *  - POOL_ERR_ALLOCATION_FAILED — ошибка при выделении буфера.
+ *  - FAT_ERR_READ_FAIL — ошибка чтения сектора.
+ *  - FAT_ERR_WRITE_FAIL — ошибка записи сектора.
+ *  - FAT_ERR_DELETE_PROTECTED — попытка удалить системный файл.
+ */
+int delete_dir_recursive_fat32(uint32_t cluster)
+{
+    if (fat_info == NULL)
+    {
+        return FAT_ERR_FS_NOT_LOADED;
+    }
+
+    FatDir_Type *entry_child;
+
+    uint32_t cluster_child;
+
+    uint8_t *buffer = pool_alloc(fat_info->bytesPerSec);
+    if (buffer == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+
+    uint32_t sector = 0;
+    uint32_t address = 0;
+    uint32_t idx = 0;
+    int status = 0;
+
+    while (1)
+    {
+        address = fat_info->address_region + (cluster - fat_info->root_cluster) * fat_info->secPerClus;
+
+        for (sector = 0; sector < fat_info->secPerClus; ++sector)
+        {
+            if (fat_info->device->read(buffer, fat_info->bytesPerSec, address + sector) < 0)
+            {
+                status = FAT_ERR_READ_FAIL;
+                goto cleanup;
+            }
+            for (idx = 0; idx < fat_info->bytesPerSec; idx += sizeof(FatDir_Type *))
+            {
+                entry_child = (FatDir_Type *)&buffer[idx];
+                if (entry_child->DIR_Name[0] == ENTRY_FREE_FULL_FAT32)
+                {
+                    status = 1;
+                    break;
+                }
+                else if (entry_child->DIR_Name[0] == ENTRY_FREE_FAT32)
+                {
+                    continue;
+                }
+                if ((entry_child->DIR_Attr & ATTR_LONG_NAME_MASK) != ATTR_LONG_NAME)
+                {
+                    join_cluster_number(&cluster_child, entry_child->DIR_FstClusHI, entry_child->DIR_FstClusLO);
+
+                    if (is_special_dir(entry_child->DIR_Name) == 0)
+                    {
+                        memset(entry_child, 0x00, sizeof(FatDir_Type));
+                        continue;
+                    }
+
+                    if (entry_child->DIR_Attr & ATTR_DIRECTORY)
+                    {
+                        status = delete_dir_recursive_fat32(cluster_child);
+                        if (status != 0)
+                        {
+                            goto cleanup;
+                        };
+                    }
+                    else if (entry_child->DIR_Attr == ATTR_SYSTEM)
+                    {
+                        status = FAT_ERR_DELETE_PROTECTED;
+                        goto cleanup;
+                    }
+                    status = delete_entry_fat32(cluster_child);
+                    if (status != 0)
+                    {
+                        goto cleanup;
+                    };
+                }
+                entry_child->DIR_Name[0] = ENTRY_FREE_FAT32;
+            }
+            if (fat_info->device->write(buffer, fat_info->bytesPerSec, address) != 0)
+            {
+                status = FAT_ERR_WRITE_FAIL;
+                goto cleanup;
+            }
+            if (status == 1)
+            {
+                status = 0;
+                goto cleanup;
+            }
+        }
+        if (get_next_cluster_fat32(&cluster) != 0)
+        {
+            status = FAT_ERR_READ_FAIL;
+            goto cleanup;
+        }
+        if (cluster == FILE_END_TABLE_FAT32)
+        {
+            break;
+        }
+    }
+
+cleanup:
+    if (pool_free_region(buffer, fat_info->bytesPerSec) != 0)
+    {
+        // Вывод в лог
+    }
+    return status;
+}
+
+/**
+ * @brief Проверяет, пустая ли директория (не содержит файлов и папок, кроме "." и "..").
+ *
+ * @param cluster Кластер директории для проверки.
+ * @return int
+ *   1 — директория пустая,
+ *   0 — содержит записи,
+ *   <0 — код ошибки.
+ */
+int is_dir_empty_fat32(uint32_t cluster)
+{
+    if (fat_info == NULL)
+    {
+        return FAT_ERR_FS_NOT_LOADED;
+    }
+    uint8_t *buffer = pool_alloc(fat_info->bytesPerSec);
+    if (buffer == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+
+    int sector = 0;
+    uint32_t address = 0;
+    uint32_t idx = 2 * sizeof(FatDir_Type); // // Пропускаем первые две записи "." и ".."
+    int status = 0;
+    while (cluster != FILE_END_TABLE_FAT32)
+    {
+        address = fat_info->address_region + (cluster - fat_info->root_cluster) * fat_info->secPerClus;
+        for (sector = 0; sector < fat_info->secPerClus; ++sector)
+        {
+            if (fat_info->device->read(buffer, fat_info->bytesPerSec, address + sector) < 0)
+            {
+                status = FAT_ERR_READ_FAIL;
+                goto cleanup;
+            }
+            for (; idx < fat_info->bytesPerSec; idx += sizeof(FatDir_Type))
+            {
+                if (buffer[idx] == ENTRY_FREE_FULL_FAT32)
+                {
+                    return 0;
+                }
+                if (buffer[idx] == ENTRY_FREE_FAT32)
+                {
+                    continue;
+                }
+                else
+                {
+                    status = FAT_ERR_DIR_NOT_EMPTY;
+                    goto cleanup;
+                }
+            }
+            idx = 0;
+        }
+        status = get_next_cluster_fat32(&cluster);
+        if (status != 0)
+        {
+            status = FAT_ERR_READ_FAIL;
+            goto cleanup;
+        }
+    }
+cleanup:
+    if (pool_free_region(buffer, fat_info->bytesPerSec) != 0)
+    {
+        // Вывод в лог
+    }
+    return status;
+}
+
+/**
+ * @brief Получить атрибут (DIR_Attr) записи в каталоге по её кластеру
+ *
+ * Функция ищет в родительском каталоге (`cluster_parent`) запись, которая
+ * указывает на `child_cluster`, и возвращает её атрибуты (`DIR_Attr`).
+ *
+ * @param cluster_parent Кластер родительского каталога
+ * @param child_cluster Кластер дочернего элемента (файла/каталога)
+ * @param attr [out] Указатель на переменную, в которую будет записан атрибут
+ * @return int Код возврата:
+ *         0 — успех,
+ *         < 0 — код ошибки (например, FAT_ERR_FS_NOT_LOADED, FAT_ERR_READ_FAIL, FAT_ERR_ENTRY_NOT_FOUND)
+ */
+int get_attr_entry_fat32(uint32_t cluster_parent, uint32_t child_cluster, uint8_t *attr)
+{
+    if (attr == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+    if (fat_info == NULL)
+    {
+        return FAT_ERR_FS_NOT_LOADED;
+    }
+    uint8_t *buffer = pool_alloc(fat_info->bytesPerSec);
+    if (buffer == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+    int sector = 0;
+    uint32_t address = 0;
+    uint32_t idx = 0;
+    int status = 0;
+    uint32_t cluster = 0;
+    FatDir_Type *entry = NULL;
+
+    while (1)
+    {
+        address = fat_info->address_region + (cluster_parent - fat_info->root_cluster) * fat_info->secPerClus;
+        for (sector = 0; sector < fat_info->secPerClus; ++sector)
+        {
+            if (fat_info->device->read(buffer, fat_info->bytesPerSec, address + sector) != 0)
+            {
+                status = FAT_ERR_READ_FAIL;
+                goto cleanup;
+            }
+            for (idx = 0; idx < fat_info->bytesPerSec; idx += sizeof(FatDir_Type))
+            {
+                if (buffer[idx] == ENTRY_FREE_FULL_FAT32)
+                {
+                    status = 0;
+                    goto cleanup;
+                }
+                if (buffer[idx] == ENTRY_FREE_FAT32)
+                {
+                    continue;
+                }
+                entry = (FatDir_Type *)&buffer[idx];
+                join_cluster_number(&cluster, entry->DIR_FstClusHI, entry->DIR_FstClusLO);
+                if (cluster == child_cluster)
+                {
+                    *attr = entry->DIR_Attr;
+                    status = 0;
+                    goto cleanup;
+                }
+            }
+        }
+        status = get_next_cluster_fat32(&cluster);
+        if (status != 0)
+        {
+            status = FAT_ERR_READ_FAIL;
+            goto cleanup;
+        }
+        if (cluster == FILE_END_TABLE_FAT32)
+        {
+            status = FAT_ERR_ENTRY_NOT_FOUND;
+            goto cleanup;
+        }
+    }
+
+cleanup:
+    if (pool_free_region(buffer, fat_info->bytesPerSec) != 0)
+    {
+        // вывести в лог
+    }
+    return status;
+}
+
+/**
+ * @brief Помечает запись каталога (и связанные с ней LFN-записи) как удалённые
+ *
+ * Функция ищет запись с указанным именем в родительском кластере,
+ * а затем помечает как удалёнными все связанные с ней LFN-записи и саму SFN-запись.
+ * Удаление производится в обратном порядке — от SFN к началу цепочки LFN.
+ *
+ * @param parent_cluster Кластер родительского каталога
+ * @param name Имя файла/каталога, который нужно удалить
+ * @return int Код возврата:
+ *         0 — успешно,
+ *         < 0 — код ошибки (FAT_ERR_ENTRY_NOT_FOUND, FAT_ERR_READ_FAIL, FAT_ERR_WRITE_FAIL и т.д.)
+ */
+int mark_dir_entry_deleted(uint32_t parent_cluster, char *name)
+{
+    FatDir_Type *entries = pool_alloc(fat_info->bytesPerSec / sizeof(FatDir_Type));
+    if (entries == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+    DirEntryPosition pos = {0};
+    int status = 0;
+    status = find_entry_by_name(name, parent_cluster, &pos);
+    if (status != 0)
+    {
+        status = FAT_ERR_ENTRY_NOT_FOUND;
+        goto cleanup;
+    }
+    uint32_t address = fat_info->address_region + (pos.cluster - fat_info->root_cluster) * fat_info->secPerClus;
+
+    uint32_t sector = pos.sector;
+    int idx = pos.offset;
+    FatDir_Type *entry = NULL;
+    uint8_t found_sfn = 0;
+
+    for (; sector >= 0; --sector)
+    {
+        if (fat_info->device->read((uint8_t *)entries, fat_info->bytesPerSec, address + sector) != 0)
+        {
+            status = FAT_ERR_READ_FAIL;
+            goto cleanup;
+        }
+        for (; idx >= 0; --idx)
+        {
+            entry = &entries[idx];
+            if ((entry->DIR_Attr & ATTR_LONG_NAME_MASK) != ATTR_LONG_NAME)
+            {
+                if (found_sfn == 1)
+                {
+                    status = 0;
+                    break;
+                }
+                else
+                {
+                    found_sfn = 1;
+                }
+            }
+            entry->DIR_Name[0] = ENTRY_FREE_FAT32;
+        }
+        if (fat_info->device->write((uint8_t *)entries, fat_info->bytesPerSec, address + sector) != 0)
+        {
+            status = FAT_ERR_WRITE_FAIL;
+            goto cleanup;
+        }
+        if (status == 0)
+        {
+            break;
+        }
+
+        idx = fat_info->bytesPerSec / sizeof(FatDir_Type);
+    }
+cleanup:
+    if (pool_free_region(entries, fat_info->bytesPerSec / sizeof(FatDir_Type)) != 0)
+    {
+        // Вывести в лог
+    }
+    return status;
+}
+
+/**
+ * @brief Удаление обычного файла по указанному пути
+ *
+ * Функция удаляет файл в файловой системе FAT32:
+ * 1. Проверяет путь и наличие FS.
+ * 2. Находит кластер файла и его родительский каталог.
+ * 3. Проверяет, что объект не является системным файлом или директорией.
+ * 4. Удаляет запись в каталоге.
+ * 5. Освобождает все кластеры, занятые файлом.
+ *
+ * @param path Абсолютный путь до файла (например, "/dir1/file.txt")
+ * @return int Код возврата:
+ *         0 — успех,
+ *         < 0 — код ошибки (например, FAT_ERR_*, POOL_ERR_*)
+ */
+int delete_file_fat32(char *path)
+{
+    if (path == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+    if (fat_info == NULL)
+    {
+        return FAT_ERR_FS_NOT_LOADED;
+    }
+
+    int status = validate_path(path);
+    if (status != 0)
+    {
+        return FAT_ERR_INVALID_PATH;
+    }
+    uint32_t file_cluster;
+    status = find_directory_fat32(path, &file_cluster);
+    if (status != 0)
+    {
+        return FAT_ERR_ENTRY_NOT_FOUND;
+    }
+
+    uint32_t size = strlen(path);
+    char *parent_dir_path = pool_alloc(size);
+    if (parent_dir_path == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    };
+
+    status = get_dir_path(path, parent_dir_path, size);
+    if (status != 0)
+    {
+        status = FAT_ERR_INVALID_PATH;
+        goto cleanup;
+    }
+    uint32_t parent_cluster = 0;
+    status = find_directory_fat32(parent_dir_path, &parent_cluster);
+    if (status != 0)
+    {
+        status = FAT_ERR_ENTRY_NOT_FOUND;
+        goto cleanup;
+    }
+
+    // проверка что это директория
+    uint8_t attr = 0;
+    status = get_attr_entry_fat32(parent_cluster, file_cluster, &attr);
+    if (status != 0 || attr == ATTR_SYSTEM)
+    {
+        status = FAT_ERR_ENTRY_NOT_FOUND;
+        goto cleanup;
+    }
+    if (attr & ATTR_DIRECTORY || attr == ATTR_SYSTEM)
+    {
+        status = FAT_ERR_IS_DIRECTORY;
+        goto cleanup;
+    }
+
+    char file_name[256];
+    status = get_last_path_component(path, file_name);
+    if (status != 0)
+    {
+        status = FAT_ERR_INVALID_PATH;
+        goto cleanup;
+    }
+
+    status = mark_dir_entry_deleted(parent_cluster, file_name);
+    if (status != 0)
+    {
+        status = FAT_ERR_WRITE_FAIL;
+        goto cleanup;
+    }
+
+    status = delete_entry_fat32(file_cluster);
+    if (status != 0)
+    {
+        status = FAT_ERR_WRITE_FAIL;
+        goto cleanup;
+    }
+cleanup:
+    if (pool_free_region(parent_dir_path, size) != 0)
+    {
+        // Вывести в лог
+    }
+    return status;
+}
+
+/**
+ * @brief Удаление директории по указанному пути
+ *
+ * В зависимости от режима удаления:
+ * - В режиме DELETE_DIR_SAFE директория удаляется только если пуста.
+ * - В режиме DELETE_DIR_RECURSIVE производится рекурсивное удаление всех вложенных файлов и поддиректорий.
+ *
+ * @param path Абсолютный путь до директории (например, "/dir1/subdir")
+ * @param mode Режим удаления:
+ *             DELETE_DIR_SAFE — только если пуста;
+ *             DELETE_DIR_RECURSIVE — рекурсивное удаление содержимого.
+ * @return int Код возврата:
+ *         0 — успех,
+ *         < 0 — ошибка (например, FAT_ERR_*, POOL_ERR_*)
+ */
+int delete_dir_fat32(char *path, DeleteDirMode mode)
+{
+    if (path == NULL)
+    {
+        return FAT_ERR_INVALID_PATH;
+    }
+    if (fat_info == NULL)
+    {
+        return FAT_ERR_FS_NOT_LOADED;
+    }
+    char *path_buff = NULL;
+    char *parent_dir_path = NULL;
+
+    uint32_t length = strlen(path);
+    if (length > 0 && path[length - 1] == '/')
+        --length;
+    path_buff = pool_alloc(length);
+    if (path_buff == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+    strncpy(path_buff, path, length);
+
+    int status = validate_path(path_buff);
+    if (status != 0)
+    {
+        status = FAT_ERR_INVALID_PATH;
+        goto cleanup;
+    }
+
+    uint32_t dir_cluster;
+    status = find_directory_fat32(path_buff, &dir_cluster);
+
+    if (status != 0)
+    {
+        status = FAT_ERR_ENTRY_NOT_FOUND;
+        goto cleanup;
+    }
+
+    parent_dir_path = pool_alloc(length);
+    if (parent_dir_path == NULL)
+    {
+        status = POOL_ERR_ALLOCATION_FAILED;
+        goto cleanup;
+    };
+
+    status = get_dir_path(path_buff, parent_dir_path, length);
+    if (status != 0)
+    {
+        status = FAT_ERR_INVALID_PATH;
+        goto cleanup;
+    }
+    uint32_t parent_cluster = 0;
+    status = find_directory_fat32(parent_dir_path, &parent_cluster);
+    if (status != 0)
+    {
+        status = FAT_ERR_ENTRY_NOT_FOUND;
+        goto cleanup;
+    }
+
+    // проверка что это директория
+    uint8_t attr = 0;
+    status = get_attr_entry_fat32(parent_cluster, dir_cluster, &attr);
+    if (status != 0 || attr != ATTR_DIRECTORY)
+    {
+        status = FAT_ERR_NOT_A_DIRECTORY;
+        goto cleanup;
+    }
+
+    if (mode == DELETE_DIR_SAFE)
+    {
+        if (is_dir_empty_fat32(dir_cluster) != 0)
+        {
+            status = FAT_ERR_DIR_NOT_EMPTY;
+            goto cleanup;
+        }
+    }
+    else
+    {
+        status = delete_dir_recursive_fat32(dir_cluster);
+        if (status != 0)
+        {
+            status = FAT_ERR_DELETE_FAIL;
+            goto cleanup;
+        }
+    }
+
+    char file_name[256];
+    status = get_last_path_component(path_buff, file_name);
+    if (status != 0)
+    {
+        status = FAT_ERR_INVALID_PATH;
+        goto cleanup;
+    }
+    status = mark_dir_entry_deleted(parent_cluster, file_name);
+    if (status != 0)
+    {
+        status = FAT_ERR_WRITE_FAIL;
+        goto cleanup;
+    }
+
+    status = delete_entry_fat32(dir_cluster);
+    if (status != 0)
+    {
+        status = FAT_ERR_WRITE_FAIL;
+    }
+cleanup:
+    if (path_buff != NULL)
+    {
+        if (pool_free_region(path_buff, length) != 0)
+        {
+            // Вывести в лог
+        }
+    }
+    if (parent_dir_path != NULL)
+    {
+        if (pool_free_region(parent_dir_path, length) != 0)
+        {
+            // Вывести в лог
+        }
+    }
+    return status;
+}
+
+/**
+ * @brief Читает одну запись каталога FAT32 по заданной позиции
+ *
+ * @param position Структура с координатами (кластер, сектор, индекс записи)
+ * @param entry Указатель на структуру, куда будет скопирована запись
+ * @return int Код возврата:
+ *         0 — успех,
+ *         < 0 — ошибка (например, FAT_ERR_*, POOL_ERR_*)
+ */
+int read_directory_entry_fat32(DirEntryPosition *position, FatDir_Type *entry)
+{
+    int status = 0;
+    if (position == NULL || entry == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+    if (fat_info == NULL)
+    {
+        return FAT_ERR_FS_NOT_LOADED;
+    }
+    uint8_t *buffer = pool_alloc(fat_info->bytesPerSec);
+    if (buffer == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+    uint32_t address = fat_info->address_region + (position->cluster - fat_info->root_cluster) * fat_info->secPerClus + position->sector;
+    if (fat_info->device->read(buffer, fat_info->bytesPerSec, address) != 0)
+    {
+        status = FAT_ERR_READ_FAIL;
+        goto cleanup;
+    }
+    stm_memcpy((uint8_t *)entry, (uint8_t *)buffer + position->offset * sizeof(FatDir_Type), sizeof(FatDir_Type));
+
+cleanup:
+    if (pool_free_region(buffer, fat_info->bytesPerSec) != 0)
+    {
+        // Добавить в лог
+    }
+    return status;
+}
+
+/**
+ * @brief Сравнивает ASCII-имя с именем в формате UTF-16LE (используемом в LFN записях FAT32).
+ *
+ * @param name_ascii Указатель на строку ASCII
+ * @param name_unicode Указатель на строку UTF-16LE (uint16_t)
+ * @return int 0 если строки совпадают, -1 если не совпадают
+ */
+int compare_lfn(char *name_ascii, uint16_t *name_unicode)
+{
+    uint8_t buffer[MAX_NAME_SIZE];
+    memset(buffer, 0, MAX_NAME_SIZE);
+    utf16le_to_ascii(name_unicode, buffer);
+    uint32_t length = strlen(name_ascii);
+    if (length != strlen(buffer))
+    {
+        return -1;
+    }
+
+    for (int idx = 0; idx < length; ++idx)
+    {
+        if (name_ascii[idx] != buffer[idx])
+        {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * @brief Сравнивает имя файла с коротким именем (SFN) из FAT32-структуры каталога.
+ *
+ * @param name Имя файла (в обычном виде, например "file.txt")
+ * @param length Длина строки `name`
+ * @param entry Указатель на структуру FatDir_Type (запись каталога FAT32)
+ * @return int 0 если имена совпадают, -1 если нет или если имя длиннее 11 символов
+ */
+int compare_fat32_sfn(char *name, uint32_t length, const FatDir_Type *entry)
+{
+    if (name == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+    if (length > SHORT_NAME_SIZE)
+        return -1;
+    char buffer[SHORT_NAME_SIZE];
+    format_fat_sfn(name, strlen(name), buffer);
+    for (int idx = 0; idx < SHORT_NAME_SIZE; ++idx)
+    {
+        if (buffer[idx] != entry->DIR_Name[idx])
+        {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * @brief Преобразует строку в ASCII в строку в формате UTF-16LE (младший байт первым).
+ *
+ * @param ascii_str Указатель на исходную ASCII-строку (заканчивается '\0').
+ * @param utf16le_buf Буфер, в который будет записана строка UTF-16LE.
+ *                    Должен быть как минимум в 2 раза больше по размеру, чем ascii_str.
+ */
+void ascii_to_utf16le(const char *ascii_str, uint8_t *utf16le_buf)
+{
+    while (*ascii_str)
+    {
+        *utf16le_buf++ = (uint8_t)(*ascii_str++);
+        *utf16le_buf++ = 0x00;
+    };
+
+    *utf16le_buf++ = 0x00;
+    *utf16le_buf++ = 0x00;
+}
+
+/**
+ * @brief Преобразует строку из UTF-16LE (массив 16-битных слов) в ASCII.
+ *
+ * @param utf16le_buf Указатель на UTF-16LE строку (массив uint16_t), заканчивается 0x0000.
+ * @param ascii_str Буфер, в который будет записана ASCII-строка. Должен быть заранее выделен.
+ */
+void utf16le_to_ascii(const uint16_t *utf16le_buf, char *ascii_str)
+{
+    while (*utf16le_buf != 0x0000)
+    {
+        *ascii_str++ = (char)(*utf16le_buf & 0xFF);
+        utf16le_buf++;
+    }
+    *ascii_str = '\0';
+}
+
+/**
+ * @brief Находит кластер записи (файла или папки) с заданным именем в каталоге FAT32.
+ *
+ * Функция перебирает все записи в директории, заданной кластером parent_cluster,
+ * ищет запись с именем name. Имя может быть в коротком (SFN) или длинном (LFN) формате.
+ *
+ * @param name Имя файла или папки в ASCII.
+ * @param length Длина имени.
+ * @param parent_cluster Кластер каталога, в котором ищется запись.
+ * @param out_cluster Указатель на переменную для записи кластера найденной записи.
+ * @return 0 при успехе,
+ *         POOL_ERR_ALLOCATION_FAILED при ошибке выделения памяти,
+ *         FAT_ERR_NOT_FOUND если запись не найдена,
+ *         или другой код ошибки при чтении.
+ */
+int find_entry_cluster_fat32(char *name, uint32_t length, uint32_t parent_cluster, uint32_t *out_cluster)
+{
+    uint8_t *buffer = pool_alloc(fat_info->bytesPerSec);
+    if (buffer == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+    uint32_t address = (parent_cluster - fat_info->root_cluster) * fat_info->secPerClus + fat_info->address_region;
+    uint32_t sector = 0, idxEntry = 0;
+    int status = 0;
+    uint16_t buffer_name[MAX_NAME_SIZE];
+
+    FatDir_Type *entry;
+    uint8_t lfn_active = 0;
+    uint8_t check_sum = 0;
+
+    uint8_t idx = 0;
+    uint8_t order = 0;
+
+    while (1)
+    {
+        for (sector = 0; sector < fat_info->secPerClus; ++sector)
+        {
+            status = fat_info->device->read(buffer, fat_info->bytesPerSec, address + sector);
+            if (status < 0)
+            {
+                status = FAT_ERR_READ_FAIL;
+                goto cleanup;
+            }
+            for (idxEntry = 0; idxEntry < fat_info->bytesPerSec; idxEntry += sizeof(FatDir_Type))
+            {
+                entry = (FatDir_Type *)&buffer[idxEntry];
+                if (entry->DIR_Name[0] == ENTRY_FREE_FULL_FAT32)
+                {
+                    status = FAT_ERR_NOT_FOUND;
+                    goto cleanup;
+                }
+                else if (entry->DIR_Name[0] == ENTRY_FREE_FAT32)
+                {
+                    if (lfn_active)
+                    {
+                        status = FAT_ERR_NOT_FOUND;
+                        goto cleanup;
+                    }
+                    continue;
+                }
+                else if ((entry->DIR_Attr & ATTR_LONG_NAME_MASK) == ATTR_LONG_NAME)
+                {
+                    if (((LDIR_Type *)entry)->LDIR_Ord & LFN_ENTRY_LAST)
+                        check_sum = ((LDIR_Type *)entry)->LDIR_Chksum;
+                    if (((LDIR_Type *)entry)->LDIR_Type != 0)
+                        continue;
+                    order = ((LDIR_Type *)entry)->LDIR_Ord & ~LFN_ENTRY_LAST;
+
+                    idx = (order - 1) * MAX_SYMBOLS_ENTRY;
+                    stm_memcpy((uint8_t *)(&buffer_name[idx]), ((LDIR_Type *)entry)->LDIR_Name1, sizeof(((LDIR_Type *)entry)->LDIR_Name1));
+                    idx += sizeof(((LDIR_Type *)entry)->LDIR_Name1) / 2;
+                    stm_memcpy((uint8_t *)&buffer_name[idx], ((LDIR_Type *)entry)->LDIR_Name2, sizeof(((LDIR_Type *)entry)->LDIR_Name2));
+                    idx += sizeof(((LDIR_Type *)entry)->LDIR_Name2) / 2;
+                    stm_memcpy((uint8_t *)&buffer_name[idx], ((LDIR_Type *)entry)->LDIR_Name3, sizeof(((LDIR_Type *)entry)->LDIR_Name3));
+                    lfn_active = 1;
+                }
+                else
+                {
+                    if (lfn_active)
+                    {
+                        if (ChkSum((uint8_t *)entry->DIR_Name) == check_sum)
+                        {
+                            if (compare_lfn(name, buffer_name) == 0)
+                            {
+                                join_cluster_number(out_cluster, entry->DIR_FstClusHI, entry->DIR_FstClusLO);
+                                status = 0;
+                                goto cleanup;
+                            }
+                        }
+                        lfn_active = 0;
+                        check_sum = 0;
+                        memset(buffer_name, 0x00, MAX_NAME_SIZE);
+                    }
+                    else if (compare_fat32_sfn(name, length, (FatDir_Type *)entry) == 0)
+                    {
+                        join_cluster_number(out_cluster, entry->DIR_FstClusHI, entry->DIR_FstClusLO);
+                        status = 0;
+                        goto cleanup;
+                    }
+                }
+            }
+        }
+    }
+    status = 1;
+
+cleanup:
+    if (pool_free_region(buffer, fat_info->bytesPerSec) != 0)
+    {
+        // Вывод в лог
+    }
+
+    return status;
+}
+
+/**
+ * @brief Находит кластер директории по заданному пути в файловой системе FAT32.
+ *
+ * Функция разбивает путь на компоненты (поддиректории),
+ * затем последовательно ищет каждый компонент в файловой системе,
+ * начиная с корневого кластера.
+ *
+ * @param path Строка с путем к директории (например, "/folder/subfolder").
+ * @param out_cluster Указатель на переменную, куда будет записан номер кластера найденной директории.
+ * @return 0 в случае успеха, или код ошибки в случае неудачи.
+ */
+int find_directory_fat32(char *path, uint32_t *out_cluster)
+{
+    int status = 0;
+    char *pathToDir = NULL;
+    char (*directories)[MAX_NAME_SIZE] = NULL;
+    if (path == NULL || out_cluster == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+
+    pathToDir = pool_alloc(strlen(path) + 1);
+    if (pathToDir == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+    stm_memcpy(pathToDir, path, strlen(path) + 1);
+
+    if (strcmp(path, "/") == 0)
+    {
+        *out_cluster = fat_info->root_cluster;
+        status = 0;
+        goto cleanup;
+    }
+
+    status = validate_path(pathToDir);
+    if (status != 0)
+    {
+        status = FAT_ERR_INVALID_PATH;
+        goto cleanup;
+    }
+
+    uint32_t depth = path_depth(pathToDir);
+    directories = pool_alloc(depth * MAX_NAME_SIZE);
+    if (directories == NULL)
+    {
+        status = POOL_ERR_ALLOCATION_FAILED;
+        goto cleanup;
+    }
+
+    memset(directories, 0, depth * MAX_NAME_SIZE);
+
+    status = parse_path(pathToDir, directories);
+    if (status < 0)
+    {
+        status = FAT_ERR_INVALID_PATH;
+        goto cleanup;
+    }
+
+    *out_cluster = fat_info->root_cluster;
+    for (int idxDir = 0; idxDir < depth; ++idxDir)
+    {
+        status = find_entry_cluster_fat32(directories[idxDir], strlen(directories[idxDir]), *out_cluster, out_cluster);
+        if (status != 0)
+        {
+            status = FAT_ERR_DIR_NOT_FOUND;
+            goto cleanup;
+        }
+    }
+cleanup:
+    if (pathToDir != NULL)
+    {
+        if (pool_free_region(pathToDir, strlen(path)) != 0)
+        {
+            // вывод в лог
+        }
+    }
+    if (directories != NULL)
+    {
+        if (pool_free_region(directories, depth * MAX_NAME_SIZE) != 0)
+        {
+            // вывод в лог
+        }
+    }
+    return status;
+}
+
+uint8_t ChkSum(uint8_t *pFcbName)
+{
+    short FcbNameLen;
+    uint8_t Sum;
+    Sum = 0;
+    for (FcbNameLen = 11; FcbNameLen != 0; FcbNameLen--)
+    {
+        // NOTE: The operation is an unsigned char rotate right
+        Sum = ((Sum & 1) ? 0x80 : 0) + (Sum >> 1) + *pFcbName++;
+    }
+    return (Sum);
+}
+
+/**
+ * @brief Вычисляет общее количество секторов для FAT32 тома с учетом служебных областей.
+ *
+ * Эта функция рассчитывает минимальное количество секторов между
+ * вычисленным размером служебных областей FAT32 (резервных секторов,
+ * FAT таблиц и записей FAT) и реальным размером тома.
+ * Это необходимо для корректной работы с файловой системой и предотвращения выхода за пределы.
+ *
+ * @param volume Общий размер тома в байтах.
+ * @param mbr_data Указатель на структуру с параметрами тома из MBR (Master Boot Record).
+ * @return Общее количество секторов (32-битное значение).
+ */
+uint32_t calc_tot_sec32(uint64_t volume, const MBR_Type *mbr_data)
+{
+    uint32_t record_sectors = (mbr_data->BPB_BytsPerSec / 4) * mbr_data->BPB_SecPerClus;
+    uint32_t fat_sectors = mbr_data->BPB_RsvdSecCnt + mbr_data->BPB_FATSz32 * mbr_data->BPB_NumFATs + mbr_data->BPB_FATSz32 * record_sectors;
+    uint32_t total_sectors = volume / mbr_data->BPB_BytsPerSec;
+    return (fat_sectors > total_sectors ? total_sectors : fat_sectors);
+}
+
+#include <stdio.h>
+
+#define UPDATE_INTERVAL_SECTORS 500
+#define BAR_WIDTH 50
+
+int formatted_fat32(BlockDevice *device, uint64_t capacity)
+{
+    if (device == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+    int status = 0;
+
+    // Загрузить данные MBR
+    uint8_t boot_data[512];
+    MBR_Type *mbr_data = (MBR_Type *)boot_data;
+    // mbr_data->BS_jmpBoot = {0xeb, 0x58, 0x90};//можно не указывать это для перехода в область памяти для загрузки ОС
+    stm_memcpy(mbr_data->BS_OEMName, "STM32_MS", sizeof(mbr_data->BS_OEMName));
+    mbr_data->BPB_BytsPerSec = 512;
+    if (capacity >= SIZE_2GB && capacity <= SIZE_8GB)
+    {
+        mbr_data->BPB_SecPerClus = 8; // 4096 размер сектора / 512
+    }
+    mbr_data->BPB_Media = 0xF8;
+
+    mbr_data->BPB_RootEntCnt = 0;
+    mbr_data->BPB_SecPerTrk = 63; // по default
+    mbr_data->BPB_NumHeads = 255; // по default
+
+    mbr_data->BPB_HiddSec = 0;
+
+    // Настройка таблиц
+    mbr_data->BPB_NumFATs = 2;
+    mbr_data->BPB_RsvdSecCnt = 32;
+    mbr_data->BPB_FATSz32 = calculate_size_table_fat32(capacity, mbr_data);
+
+    mbr_data->BPB_TotSec32 = calc_tot_sec32(capacity, mbr_data);
+
+    mbr_data->BPB_ExtFlags = 0;
+    mbr_data->BPB_FSVer = 0;
+
+    mbr_data->BPB_RootClus = 2;
+    mbr_data->BPB_FSInfo = 1;
+    mbr_data->BPB_BkBootSec = 6;
+
+    mbr_data->BS_DrvNum = 0x80;
+    mbr_data->BS_BootSig = 0x29;
+    mbr_data->BS_VolID = 345;
+    stm_memcpy(mbr_data->BS_VolLab, "STM32F407", sizeof(mbr_data->BS_VolLab));
+    stm_memcpy(mbr_data->BS_FilSysType, "FAT32 ", sizeof(mbr_data->BS_FilSysType));
+    mbr_data->Signature_word = WORD_SIGNATURE;
+
+    // ========== 1. Очистка системной области ==========
+    // Очищаются начальные системные сектора:
+    // - Главный загрузочный сектор (LBA 0)
+    // - FSInfo-сектор (LBA 1)
+    // - Копия загрузочного сектора (Backup Boot Sector, LBA 6)
+
+    uint32_t sectors_to_clear = mbr_data->BPB_RsvdSecCnt + mbr_data->BPB_NumFATs * mbr_data->BPB_FATSz32 *
+                                                               2 * mbr_data->BPB_SecPerClus;
+
+    status = device->clear(0, sectors_to_clear);
+    if (status < 0)
+    {
+        return FAT_ERR_WRITE_FAIL;
+    }
+
+    status = device->write(boot_data, sizeof(MBR_Type), 0);
+    if (status < 0)
+    {
+        return FAT_ERR_WRITE_FAIL;
+    }
+    status = device->write(boot_data, sizeof(MBR_Type), 6); //
+    if (status < 0)
+    {
+        return FAT_ERR_WRITE_FAIL;
+    }
+
+    FSInfo_Type fs_info = {0};
+    fs_info.FSI_LeadSig = LEAD_SIGNATURE;
+    fs_info.FSI_StrucSig = STRUCT_SIGNATURE;
+    fs_info.FSI_TrailSig = TRAIL_SIGNATURE;
+
+    uint32_t free_count_claster = (mbr_data->BPB_TotSec32 - mbr_data->BPB_RsvdSecCnt - (mbr_data->BPB_FATSz32 * mbr_data->BPB_NumFATs)) / mbr_data->BPB_SecPerClus;
+    fs_info.FSI_Free_Count = free_count_claster - 4;
+
+    fs_info.FSI_Nxt_Free = 4; // 0 и 1 не должны использоваться
+    status = device->write((uint8_t *)&fs_info, sizeof(FSInfo_Type), 1);
+    if (status < 0)
+    {
+        return FAT_ERR_WRITE_FAIL;
+    }
+
+    // Заполение таблицы 1 и 2
+    uint32_t tabl1_addr = mbr_data->BPB_RsvdSecCnt + mbr_data->BPB_HiddSec;
+    uint32_t tabl2_addr = mbr_data->BPB_FATSz32 + tabl1_addr;
+
+    int max_records = mbr_data->BPB_BytsPerSec / 4;
+    uint32_t records[max_records];
+    uint32_t idx = 0;
+    for (idx = 0; idx < max_records; ++idx)
+    {
+        records[idx] = FREE_CLUSTER;
+    }
+
+    for (int idxSector = 0; idxSector < mbr_data->BPB_FATSz32; ++idxSector)
+    {
+        status = device->write((uint8_t *)records, 512, (tabl1_addr + idxSector));
+        if (status < 0)
+        {
+            return FAT_ERR_WRITE_FAIL;
+        }
+        status = device->write((uint8_t *)records, 512, (tabl2_addr + idxSector));
+        if (status < 0)
+        {
+            return FAT_ERR_WRITE_FAIL;
+        }
+    }
+
+    records[0] = RESERV_CLUSTER_FAT32;
+    records[1] = FAT32_CLUSTER_END;
+    records[2] = FAT32_CLUSTER_END;
+    records[3] = FAT32_CLUSTER_END;
+
+    status = device->write((uint8_t *)records, 512, tabl1_addr);
+    if (status < 0)
+    {
+        return FAT_ERR_WRITE_FAIL;
+    }
+    status = device->write((uint8_t *)records, 512, tabl2_addr);
+    if (status < 0)
+    {
+        return FAT_ERR_WRITE_FAIL;
+    }
+
+    FatDir_Type dir = {
+        .DIR_Attr = ATTR_DIRECTORY,
+        .DIR_FileSize = 0,
+        .DIR_Name = {'M', 'Y', 'D', 'I', 'R', ' ', ' ', ' ', ' ', ' ', ' '},
+        .DIR_FstClusHI = 0,
+        .DIR_FstClusLO = 3,
+    };
+
+    uint32_t data_addr = tabl2_addr + mbr_data->BPB_FATSz32;
+
+    status = device->write((uint8_t *)&dir, sizeof(dir), (data_addr + (2 - mbr_data->BPB_RootClus) * mbr_data->BPB_SecPerClus));
+    if (status < 0)
+    {
+        return FAT_ERR_WRITE_FAIL;
+    }
+    uint8_t buffer_data[512] = {0};
+
+    FatDir_Type dir1 = {
+        .DIR_Attr = ATTR_DIRECTORY,
+        .DIR_FileSize = 0,
+        .DIR_Name = {'.', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' '},
+        .DIR_FstClusHI = 0,
+        .DIR_FstClusLO = 3,
+    };
+    FatDir_Type dir2 = {
+        .DIR_Attr = ATTR_DIRECTORY,
+        .DIR_FileSize = 0,
+        .DIR_Name = {'.', '.', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' '},
+        .DIR_FstClusHI = 0,
+        .DIR_FstClusLO = 2,
+    };
+    stm_memcpy(buffer_data, (uint8_t *)&dir1, sizeof(dir1));
+    stm_memcpy(buffer_data + sizeof(dir1), (uint8_t *)&dir2, sizeof(dir2));
+
+    status = device->write(buffer_data, sizeof(buffer_data), (data_addr + (3 - mbr_data->BPB_RootClus) * mbr_data->BPB_SecPerClus));
+    if (status < 0)
+    {
+        return FAT_ERR_WRITE_FAIL;
+    }
+    return 0;
+}
+
+// ---------------------------------------
+void print_char(char *text, int size)
+{
+    if (text == NULL)
+    {
+        printf("Error: NULL pointer encountered\n");
+        return;
+    }
+
+    for (int i = 0; i < size; ++i)
+    {
+        printf("%c", text[i]);
+    }
+}
+void show_mbr(MBR_Type *data)
+{
+    printf("MBR:");
+    printf("\tBPB_SecPerClus: %d, BPB_BytsPerSec: %d, BPB_RsvdSecCnt: %d\n", data->BPB_SecPerClus, data->BPB_BytsPerSec, data->BPB_RsvdSecCnt);
+    printf("\tBPB_NumFATs: %d, BPB_RootEntCnt: %d, BPB_HiddSec: %d\n", data->BPB_NumFATs, data->BPB_RootEntCnt, data->BPB_HiddSec);
+    printf("\tBPB_TotSec32: %d, BPB_FATSz32: %d, BPB_FSVer: %d\n", data->BPB_TotSec32, data->BPB_FATSz32, data->BPB_FSVer);
+    printf("\tBPB_RootClus: %d, BPB_FSInfo: %d, Signature_word: %d\n", data->BPB_RootClus, data->BPB_FSInfo, data->Signature_word);
+
+    printf("\tBPB_ExtFlags: %d, BPB_NumHeads: %d, BPB_SecPerTrk: %d\n", data->BPB_ExtFlags, data->BPB_NumHeads, data->BPB_SecPerTrk);
+    printf("\tBPB_BkBootSec: %d\n", data->BPB_BkBootSec);
+
+    printf("\tBS_jmpBoot: %x %x %x\n", data->BS_jmpBoot[0], data->BS_jmpBoot[1], data->BS_jmpBoot[2]);
+
+    printf("\tBS_OEMName: ");
+    print_char((char *)data->BS_OEMName, sizeof(data->BS_OEMName));
+    printf("\tBS_FilSysType: ");
+    print_char((uint8_t *)data->BS_FilSysType, sizeof(data->BS_FilSysType));
+    printf("\tBS_VolLab: ");
+    print_char((uint8_t *)data->BS_VolLab, sizeof(data->BS_VolLab));
+    puts(" ");
+}
+
+void show_fs_info(FSInfo_Type *data)
+{
+    printf("FSInfo:");
+    printf("\tFSI_Nxt_Free: %d, FSI_Free_Count: %d\n", data->FSI_Nxt_Free, data->FSI_Free_Count);
+}
+void show_dir_data(const FatDir_Type *file)
+{
+    if (file == NULL)
+    {
+        return;
+    }
+    printf("DIR_Name: ");
+    print_char(file->DIR_Name, 11);
+    printf(" DIR_Attr: %u, DIR_NTRes: %u, DIR_FstClusHI: %u, DIR_FstClusLO: %u,  DIR_FileSize: %u\n", file->DIR_Attr, file->DIR_NTRes, file->DIR_FstClusHI, file->DIR_FstClusLO, file->DIR_FileSize);
+}
+
+void show_unicode(uint16_t *buffer, size_t length)
+{
+    for (int i = 0; i < length; ++i)
+    {
+        printf("%04x ", buffer[i]);
+    }
+    puts("");
+}
+
+void show_lentry_data(LDIR_Type *entry)
+{
+    if (entry == NULL)
+        return;
+
+    printf("LDIR_Ord: %d,LDIR_Attr: %x, LDIR_Chksum: %d, LDIR_FstClusLO: %d, LDIR_Type: %d\n", entry->LDIR_Ord, entry->LDIR_Attr, entry->LDIR_Chksum,
+           entry->LDIR_FstClusLO, entry->LDIR_Type);
+
+    printf("Name1: ");
+    show_unicode((uint16_t *)entry->LDIR_Name1, sizeof(entry->LDIR_Name1) / 2);
+
+    printf("Name2: ");
+    show_unicode((uint16_t *)entry->LDIR_Name2, sizeof(entry->LDIR_Name2) / 2);
+
+    printf("Name3: ");
+    show_unicode((uint16_t *)entry->LDIR_Name3, sizeof(entry->LDIR_Name3) / 2);
+}
+
+// ----------------------
+
+void init_fat_layout_info(MBR_Type *mbr_data)
+{
+    if (fat_info == NULL)
+    {
+        return;
+    }
+    stm_memcpy((uint8_t *)&fat_info->mbr_data, (uint8_t *)mbr_data, sizeof(MBR_Type));
+    fat_info->bytesPerSec = mbr_data->BPB_BytsPerSec;
+    fat_info->root_cluster = mbr_data->BPB_RootClus;
+    fat_info->secPerClus = mbr_data->BPB_SecPerClus;
+    fat_info->fat_ents_sec = mbr_data->BPB_BytsPerSec / 4;
+    fat_info->sizeFAT = mbr_data->BPB_FATSz32;
+    // Вычисляем адреса таблиц FAT
+    fat_info->address_tabl1 = mbr_data->BPB_HiddSec + mbr_data->BPB_RsvdSecCnt;
+    fat_info->address_tabl2 += fat_info->address_tabl1 + fat_info->sizeFAT;
+    // Адрес начала области данных (регион данных)
+    fat_info->address_region = fat_info->address_tabl2 + fat_info->sizeFAT;
+}
+
+int mount_fat32(BlockDevice *device)
+{
+    if (device == NULL)
+    {
+        return FAT_ERR_INVALID_ARGUMENT;
+    }
+
+    fat_info = pool_alloc(sizeof(FatLayoutInfo));
+    if (fat_info == NULL)
+    {
+        // Вывести в лог
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+    fat_info->device = device;
+
+    uint8_t buffer[sizeof(MBR_Type)];
+    int status = fat_info->device->read(buffer, sizeof(MBR_Type), 0);
+    if (status != 0)
+    {
+        return FAT_ERR_READ_FAIL;
+    }
+
+    MBR_Type *mbr_data = (MBR_Type *)buffer;
+
+    if (mbr_data->Signature_word != WORD_SIGNATURE)
+    {
+        printf("MBR not valid!\n");
+        return FAT_ERR_INVALID_MBR;
+    }
+    if (mbr_data->BPB_FATSz16 != 0)
+    {
+        printf("It isn't fat32!\n");
+        return FAT_ERR_NOT_FAT32;
+    }
+    // перерасчёт таблицы и памяти для провреки
+
+    // Инициализация структуры
+    init_fat_layout_info(mbr_data);
+    show_mbr(mbr_data);
+
+    status = fat_info->device->read(buffer, 512, 1);
+    if (status < 0)
+    {
+        return status;
+    }
+    show_fs_info((FSInfo_Type *)buffer);
+
+    return 0;
+}
+
+int clear_table_fat32()
+{
+    if (fat_info == NULL)
+        return FAT_ERR_FS_NOT_LOADED;
+
+    uint32_t *buffer = pool_alloc(fat_info->bytesPerSec);
+    if (buffer == NULL)
+    {
+        return POOL_ERR_ALLOCATION_FAILED;
+    }
+
+    uint32_t fat_sectors = fat_info->sizeFAT;
+    int status = 0;
+    // Обработка первого сектора
+    status = fat_info->device->read((uint8_t *)buffer, fat_info->bytesPerSec, fat_info->address_tabl1);
+    if (status < 0)
+    {
+        status = FAT_ERR_READ_FAIL;
+        goto cleanup;
+    }
+
+    memset(&buffer[4], 0x00, sizeof(buffer) - 16);
+
+    // Запись в основную FAT таблицу
+    status = fat_info->device->write((uint8_t *)buffer, fat_info->bytesPerSec, fat_info->address_tabl1);
+    if (status < 0)
+    {
+        status = FAT_ERR_WRITE_FAIL;
+        goto cleanup;
+    }
+
+    // Запись в резервную FAT таблицу
+    status = fat_info->device->write((uint8_t *)buffer, fat_info->bytesPerSec, fat_info->address_tabl2);
+    if (status < 0)
+    {
+        status = FAT_ERR_WRITE_FAIL;
+        goto cleanup;
+    }
+
+    // Обработка остальных секторов
+    memset(buffer, 0x00, sizeof(buffer));
+    for (uint32_t i = 1; i < fat_sectors; ++i)
+    {
+        status = fat_info->device->write((uint8_t *)buffer, fat_info->bytesPerSec, fat_info->address_tabl1 + i);
+        if (status < 0)
+        {
+            status = FAT_ERR_WRITE_FAIL;
+            goto cleanup;
+        }
+        status = fat_info->device->write((uint8_t *)buffer, fat_info->bytesPerSec, fat_info->address_tabl2 + i);
+        if (status < 0)
+        {
+            status = FAT_ERR_WRITE_FAIL;
+            goto cleanup;
+        }
+    }
+cleanup:
+    if (pool_free_region(buffer, fat_info->bytesPerSec) != 0)
+    {
+        // Добавить в лог
+    }
+
+    return status;
+}
+
+// --------------------------------
+
+int show_entry_fat32(uint32_t sector)
+{
+    if (fat_info == NULL)
+    {
+        return -1;
+    }
+
+    uint8_t buffer[512];
+    fat_info->device->read(buffer, 512, sector);
+    printf("sector: %d\n", sector);
+    FatDir_Type *entry;
+    for (int i = 0; i < 512; i += sizeof(FatDir_Type))
+    {
+        entry = (FatDir_Type *)&buffer[i];
+        if (entry->DIR_Name[0] == ENTRY_FREE_FULL_FAT32)
+            break;
+        else if (entry->DIR_Name[0] == ENTRY_FREE_FAT32)
+            printf("entry is free!\n");
+        else
+        {
+            if ((entry->DIR_Attr & ATTR_LONG_NAME_MASK) == ATTR_LONG_NAME)
+                show_lentry_data((LDIR_Type *)&buffer[i]);
+            else
+                show_dir_data((FatDir_Type *)&buffer[i]);
+        }
+    }
+
+    // while(1){
+    //     fat_info->device->read(buffer, 512, );
+    // }
+
+    return 0;
+}
+
+int show_table_fat32(uint32_t sector)
+{
+    uint32_t buffer[128];
+    printf("table 1 sector: %d\n", sector);
+    fat_info->device->read((uint8_t *)buffer, 512, sector);
+    for (int i = 0; i < 128; ++i)
+    {
+        printf("cluster %d: %x ", i, buffer[i]);
+    }
+    puts("");
+}
