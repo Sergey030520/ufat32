@@ -13,7 +13,9 @@ add_subdirectory(src)
 
 # Пример main
 if(BUILD_EXAMPLE)
-    add_executable(main_exec examples/main_example.c)
+    add_executable(main_exec examples/main_example.c examples/mock_sd.h examples/mock_sd.c)
+
+    target_include_directories(main_exec PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
     # Выбираем адаптер логирования
     if(USE_STM_LOG)
@@ -24,7 +26,8 @@ if(BUILD_EXAMPLE)
         add_library(fat32_log_adapter src/log_stub.c)
     endif()
 
-    target_link_libraries(main_exec fat32_lib fat32_log_adapter)
+    target_include_directories(fat32_log_adapter PUBLIC ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    target_link_libraries(main_exec PRIVATE fat32_lib fat32_log_adapter)
 endif()
 
 # Тесты
