@@ -23,6 +23,6 @@
 build/
 docs/
 
-sd.bin
+examples/sd.bin
 
-# End of https://www.toptal.com/developers/gitignore/api/visualstudiocode
+# End of https://www.toptal.com/developers/gitignore/api/visualstudiocodeexamples/sd.bin

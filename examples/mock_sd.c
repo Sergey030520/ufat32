@@ -2,7 +2,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-char *pathToSD = "/home/sergeyathlete/Code/Boards/repka-pi/ufat32/examples/sd.bin";
+
+// Путь до файла 
+char *pathToSD = "sd.bin";
 
 
 int mock_sd_write(const uint8_t *data, uint32_t size, uint32_t address, uint32_t timeout)
