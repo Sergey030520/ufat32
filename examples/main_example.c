@@ -3,7 +3,7 @@
 #include "fat32/FAT32.h"
 #include "mock_sd.h"
 #include <memory.h>
-#include "fat32/log_fat32.h"
+#include "log_linux_example.h"
 #include "fat32/fat32_alloc.h"
 
 
@@ -30,6 +30,7 @@ int main()
 {
     int status = 0;
     
+    fat32_set_logger(fat32_log);
 
     BlockDevice device = {
         .read = read_sd,
@@ -105,7 +106,6 @@ int main()
     return 0;
 }
 
-#include "fat32/pool_memory.h"
 
 int init_fat32(BlockDevice *device)
 {
@@ -114,9 +114,7 @@ int init_fat32(BlockDevice *device)
         return -1;
     }
     
-    allocator.alloc = pool_alloc;
-    allocator.free = pool_free_region;
-    allocator.allocator_init = pool_init;
+
     fat32_allocator_init(NULL);
 
 
@@ -252,4 +250,3 @@ int clear_sd(uint32_t sector_num, uint32_t sector_count, uint32_t sector_size)
     uint32_t offset = (sector_count * sector_size + 512 - 1) / 512;
     return mock_sd_erase(block_start, offset);
 }
-

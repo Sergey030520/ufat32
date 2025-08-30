@@ -1,6 +1,4 @@
-#include "fat32/log_fat32.h"
-#include <stdio.h>
-#include <stdarg.h>
+#include "log_linux_example.h"
 
 
 void fat32_log(Fat32LogLevel level, const char *file, int line, const char *format, ...)
@@ -19,3 +17,5 @@ void fat32_log(Fat32LogLevel level, const char *file, int line, const char *form
     printf("\n");
     va_end(args);
 }
+
+

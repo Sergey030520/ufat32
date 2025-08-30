@@ -1,33 +1,28 @@
 cmake_minimum_required(VERSION 3.15)
 project(fat32_project C CXX)
 
-option(BUILD_EXAMPLE "Build example main program" ON)
+option(BUILD_EXAMPLE "Build example main program" OFF)
 option(BUILD_TESTS "Build tests" OFF)
 
-# Опции логирования
-option(USE_STM_LOG "Use STM logging" OFF)
-option(USE_LINUX_LOG "Use Linux logging" ON)  # по умолчанию для Linux
+
 
 # Добавляем src как библиотеку
 add_subdirectory(src)
 
 # Пример main
 if(BUILD_EXAMPLE)
-    add_executable(main_exec examples/main_example.c examples/mock_sd.h examples/mock_sd.c)
+    add_executable(fat32_example
+        examples/main_example.c
+        examples/mock_sd.c
+        examples/log_linux_example.c
+    )
 
-    target_include_directories(main_exec PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(fat32_example PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        examples
+    )
 
-    # Выбираем адаптер логирования
-    if(USE_STM_LOG)
-        add_library(fat32_log_adapter src/log_stm.c)
-    elseif(USE_LINUX_LOG)
-        add_library(fat32_log_adapter src/log_linux.c)
-    else()
-        add_library(fat32_log_adapter src/log_stub.c)
-    endif()
-
-    target_include_directories(fat32_log_adapter PUBLIC ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
-    target_link_libraries(main_exec PRIVATE fat32_lib fat32_log_adapter)
+    target_link_libraries(fat32_example PRIVATE fat32_lib)
 endif()
 
 # Тесты
