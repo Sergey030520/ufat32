@@ -5,6 +5,7 @@
 #include <memory.h>
 #include "log_linux_example.h"
 #include "fat32/fat32_alloc.h"
+#include "example_pool_memory.h"
 
 
 Fat32Allocator allocator = {0};
@@ -30,7 +31,11 @@ int main()
 {
     int status = 0;
     
-    fat32_set_logger(fat32_log);
+    allocator.alloc = pool_alloc;
+    allocator.allocator_init = pool_init;
+    allocator.free = pool_free_region;
+    fat32_set_logger(linux_log);
+    fat32_allocator_init(&allocator);
 
     BlockDevice device = {
         .read = read_sd,
@@ -39,6 +44,7 @@ int main()
         .block_size=512};
     // clear_sd(0, (uint32_t)(SIZE_8GB/512));
     status = init_fat32(&device);
+    
     if(status != 0){
         FAT32_LOG_INFO("error init fat32: %d\n", status);
         return 0;
@@ -56,7 +62,7 @@ int main()
     {
         printf("error: %d\n", status);
     }
-    status = mkdir_fat32("/MYDIR/TEST1/test1");
+    status = mkdir_fat32("/MYDIR/RES/TEST1/test1");
     if (status == 0)
     {
         printf("folder create!\n");
@@ -66,11 +72,11 @@ int main()
         printf("error: %d\n", status);
     }
     FAT32_File *file = NULL;
-    status = open_file_fat32("/MYDIR/TEST1/test1/1.txt", &file, F_WRITE);
+    status = open_file_fat32("/MYDIR/TEST1/1.txt", &file, F_WRITE);
     if(status != 0 || file == NULL){
         printf("file is not open: %d\n", status);
     }
-    status = path_exists_fat32("/MYDIR/TEST1/test1/1.txt");
+    status = path_exists_fat32("/MYDIR/TEST1/1.txt");
     if(status != 0){
         printf("file is not exists!\n");
     }
@@ -91,7 +97,7 @@ int main()
         }
     }
 
-     status = open_file_fat32("/MYDIR/TEST1/test1/1.txt", &file, F_READ);
+     status = open_file_fat32("/MYDIR/TEST1/1.txt", &file, F_READ);
     if(status != 0 || file == NULL){
         printf("file is not open: %d\n", status);
     }
@@ -115,7 +121,7 @@ int init_fat32(BlockDevice *device)
     }
     
 
-    fat32_allocator_init(NULL);
+    
 
 
     int status = mount_fat32(device);
@@ -171,7 +177,7 @@ int read_sd(uint8_t *buffer, uint32_t sector_count, uint32_t start_sector, uint3
     if (remaining_bytes > 0)
     {
         uint8_t *tmp_block = fat32_alloc(block_size);
-        if (tmp_block == NULL) return POOL_ERR_ALLOCATION_FAILED;
+        if (tmp_block == NULL) return FAT32_ERR_ALLOC_FAILED;
 
         int status = read_safe_sd(tmp_block, 1, block_start + full_blocks, DEFAULT_TIMEOUT);
         if (status != 0) 

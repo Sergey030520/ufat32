@@ -15,6 +15,7 @@ if(BUILD_EXAMPLE)
         examples/main_example.c
         examples/mock_sd.c
         examples/log_linux_example.c
+        examples/example_pool_memory.c
     )
 
     target_include_directories(fat32_example PRIVATE

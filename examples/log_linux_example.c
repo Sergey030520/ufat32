@@ -1,7 +1,7 @@
 #include "log_linux_example.h"
 
 
-void fat32_log(Fat32LogLevel level, const char *file, int line, const char *format, ...)
+void linux_log(Fat32LogLevel level, const char *file, int line, const char *format, va_list args)
 {
     const char *level_str = "";
     switch(level) {
@@ -10,12 +10,9 @@ void fat32_log(Fat32LogLevel level, const char *file, int line, const char *form
         case FAT32_LOG_ERROR: level_str = "ERROR"; break;
     }
 
-    va_list args;
-    va_start(args, format);
     printf("[%s] %s:%d: ", level_str, file, line);
-    vprintf(format, args);
+    vprintf(format, args); 
     printf("\n");
-    va_end(args);
 }
 
 

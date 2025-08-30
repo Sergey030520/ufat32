@@ -9,11 +9,7 @@
 #include "fat32/file_utils.h"
 #include "fat32/log_fat32.h"
 
-
-
-
 FatLayoutInfo *fat_info = NULL;
-
 
 void *stm_memcpy(void *dest, const void *src, uint32_t size);
 
@@ -46,8 +42,6 @@ void split_cluster_number(uint32_t cluster, uint16_t *high, uint16_t *low);
 // File name handling
 // ===============================
 int fat32_compare_sfn(char *name, uint32_t length, const FatDir_Type *entry);
-
-
 
 /**
  * Извлекает путь к директории из полного пути к файлу/каталогу.
@@ -572,8 +566,6 @@ cleanup:
     return NULL;
 }
 
-
-
 int flush_fat32(FAT32_File *file)
 {
     if (fat_info == NULL || file == NULL)
@@ -589,7 +581,9 @@ int flush_fat32(FAT32_File *file)
 
     Fat32_DateTime datetime = {0};
 
-    // status = get_cur_time_and_date(&date, &time);
+    if (fat_info->device->datetime)
+        status = fat_info->device->datetime(&datetime);
+
     if (status == 0)
     {
         fat32_date_to_fat(&datetime.date, &entry.DIR_WrtDate);
@@ -766,7 +760,7 @@ int write_file_fat32(FAT32_File *file, uint8_t *buffer, uint32_t length)
     uint32_t to_copy = 0;
     uint16_t shift = file->position.byte_offset;
     int status = 0;
-
+    FAT32_LOG_INFO("next_cluster: %d, adderess:%d, shift:%d\r\n", next_cluster, address, shift);
     while (1)
     {
         for (; sector < fat_info->secPerClus; ++sector)
@@ -1054,7 +1048,7 @@ int mkdir_fat32(char *path)
     {
         return FAT32_ERR_INVALID_PATH;
     }
-    FAT32_LOG_INFO("name new dir: %s\n", file_name);
+    FAT32_LOG_INFO("name new dir: %s\r\n", file_name);
     // Проверка имени директории
     status = validate_fat_lfn_dir(file_name);
     if (status != 0)
@@ -1101,8 +1095,6 @@ cleanup:
     }
     return status;
 }
-
-
 
 /**
  * Разделяет 32-битный номер кластера на две 16-битные части: старшую и младшую.
@@ -1438,8 +1430,6 @@ int path_exists_fat32(char *path)
     return (find_directory_fat32(path, &cluster) == 0 ? 0 : 1);
 }
 
-
-
 /**
  * @brief Заполняет поля имени в LFN-структуре (Long File Name) символами UTF-16.
  *
@@ -1567,7 +1557,7 @@ int find_free_dir_entries(uint32_t parent_cluster, const uint16_t entry_count, D
         address = (parent_cluster - fat_info->root_cluster) * fat_info->secPerClus + fat_info->address_region;
         for (sector = 0; sector < fat_info->secPerClus; ++sector)
         {
-            status = fat_info->device->read(buffer, 1, address + sector,fat_info->bytesPerSec);
+            status = fat_info->device->read(buffer, 1, address + sector, fat_info->bytesPerSec);
             if (status < 0)
             {
                 status = FAT32_ERR_READ_FAIL;
@@ -1763,7 +1753,8 @@ int create_dir_fat32(char *name, uint32_t length, uint32_t parent_cluster)
 
     Fat32_DateTime datetime = {0};
 
-    // status = get_cur_time_and_date(&date, &time);
+    if (fat_info->device->datetime)
+        status = fat_info->device->datetime(&datetime);
 
     entry->DIR_Attr = ATTR_DIRECTORY;
     if (status == 0)
@@ -1876,7 +1867,6 @@ int delete_entry_fat32(uint32_t cluster_file)
     };
     return 0;
 }
-
 
 /**
  * @brief Рекурсивно удаляет директорию и всё её содержимое (файлы и поддиректории) в FAT32.
@@ -2511,7 +2501,6 @@ cleanup:
     return status;
 }
 
-
 /**
  * @brief Сравнивает имя файла с коротким именем (SFN) из FAT32-структуры каталога.
  *
@@ -2539,7 +2528,6 @@ int fat32_compare_sfn(char *name, uint32_t length, const FatDir_Type *entry)
     }
     return 0;
 }
-
 
 /**
  * @brief Находит кластер записи (файла или папки) с заданным именем в каталоге FAT32.
@@ -2729,7 +2717,7 @@ int find_directory_fat32(char *path, uint32_t *out_cluster)
 cleanup:
     if (pathToDir != NULL)
     {
-        if (fat32_free(pathToDir, strlen(path)+1) != 0)
+        if (fat32_free(pathToDir, strlen(path) + 1) != 0)
         {
             // вывод в лог
         }
@@ -2743,7 +2731,6 @@ cleanup:
     }
     return status;
 }
-
 
 /**
  * @brief Вычисляет общее количество секторов для FAT32 тома с учетом служебных областей.
@@ -2765,8 +2752,6 @@ uint32_t calc_tot_sec32(uint64_t volume, const MBR_Type *mbr_data)
     return (fat_sectors > total_sectors ? total_sectors : fat_sectors);
 }
 
-
-
 int formatted_fat32(BlockDevice *device, uint64_t capacity)
 {
     if (device == NULL)
@@ -2781,7 +2766,8 @@ int formatted_fat32(BlockDevice *device, uint64_t capacity)
     // mbr_data->BS_jmpBoot = {0xeb, 0x58, 0x90};//можно не указывать это для перехода в область памяти для загрузки ОС
     stm_memcpy(mbr_data.BS_OEMName, "STM32_MS", sizeof(mbr_data.BS_OEMName));
 
-    if(device->block_size == 0) mbr_data.BPB_BytsPerSec = 512;
+    if (device->block_size == 0)
+        mbr_data.BPB_BytsPerSec = 512;
     mbr_data.BPB_BytsPerSec = device->block_size;
 
     if (capacity >= SIZE_2GB && capacity <= SIZE_8GB)
@@ -2891,7 +2877,7 @@ int formatted_fat32(BlockDevice *device, uint64_t capacity)
 
     uint8_t sectors_per_write = 10;
     int max_records = (mbr_data.BPB_BytsPerSec * sectors_per_write) / 4;
-    
+
     uint32_t records[max_records];
     uint32_t idx = 0;
     for (idx = 0; idx < max_records; ++idx)
@@ -2899,18 +2885,17 @@ int formatted_fat32(BlockDevice *device, uint64_t capacity)
         records[idx] = FREE_CLUSTER;
     }
 
-    for (idx = 0; idx < mbr_data.BPB_FATSz32;  idx+=sectors_per_write)
+    for (idx = 0; idx < mbr_data.BPB_FATSz32; idx += sectors_per_write)
     {
-        status = device->write((uint8_t *)records, sectors_per_write, (tabl1_addr + idx),mbr_data.BPB_BytsPerSec);
+        status = device->write((uint8_t *)records, sectors_per_write, (tabl1_addr + idx), mbr_data.BPB_BytsPerSec);
         if (status < 0)
         {
             FAT32_LOG_INFO("Error device write sector of table 1 (sector: %d, status: %d)!\r\n",
                            tabl1_addr + idx, status);
             return FAT32_ERR_WRITE_FAIL;
         }
-        
     }
-    for (idx = 0; idx < mbr_data.BPB_FATSz32;  idx+=sectors_per_write)
+    for (idx = 0; idx < mbr_data.BPB_FATSz32; idx += sectors_per_write)
     {
         status = device->write((uint8_t *)records, sectors_per_write, (tabl2_addr + idx), mbr_data.BPB_BytsPerSec);
         if (status < 0)
@@ -2918,11 +2903,9 @@ int formatted_fat32(BlockDevice *device, uint64_t capacity)
             FAT32_LOG_INFO("Error device write sector of table 2 (sector: %d, status: %d)!\r\n",
                            tabl2_addr + idx, status);
             return FAT32_ERR_WRITE_FAIL;
-        }        
+        }
     }
 
-
-    
     FAT32_LOG_INFO("Tables written successfully.\r\n");
 
     records[0] = RESERV_CLUSTER_FAT32;
