@@ -4,10 +4,12 @@ add_library(fat32_lib
     file_utils.c
     debug.c
     fat32_alloc.c
-    pool_memory.c
+    log_fat32.c
 )
 
 target_include_directories(fat32_lib PUBLIC 
     ${CMAKE_CURRENT_SOURCE_DIR} 
-    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
 )
+
+
